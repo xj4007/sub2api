@@ -45,3 +45,33 @@ func TestBuildRedisOptions(t *testing.T) {
 	require.NotNil(t, optsTLS.TLSConfig)
 	require.Equal(t, "localhost", optsTLS.TLSConfig.ServerName)
 }
+
+func TestBuildRedisClientUsesSentinelFailover(t *testing.T) {
+	cfg := &config.Config{
+		Redis: config.RedisConfig{
+			Password:            "secret",
+			DB:                  3,
+			DialTimeoutSeconds:  5,
+			ReadTimeoutSeconds:  3,
+			WriteTimeoutSeconds: 4,
+			PoolSize:            100,
+			MinIdleConns:        10,
+			EnableTLS:           true,
+			SentinelEnabled:     true,
+			SentinelMasterName:  "sub2api-redis",
+			SentinelAddrs:       "10.0.0.1:26379,10.0.0.2:26379,10.0.0.3:26379",
+		},
+	}
+
+	options := buildRedisFailoverOptions(cfg)
+	require.Equal(t, "sub2api-redis", options.MasterName)
+	require.Equal(t, []string{"10.0.0.1:26379", "10.0.0.2:26379", "10.0.0.3:26379"}, options.SentinelAddrs)
+	require.Equal(t, "secret", options.Password)
+	require.Equal(t, 3, options.DB)
+	require.Equal(t, 5*time.Second, options.DialTimeout)
+	require.Equal(t, 3*time.Second, options.ReadTimeout)
+	require.Equal(t, 4*time.Second, options.WriteTimeout)
+	require.Equal(t, 100, options.PoolSize)
+	require.Equal(t, 10, options.MinIdleConns)
+	require.NotNil(t, options.TLSConfig)
+}

@@ -1,0 +1,35 @@
+services:
+  pgproxy:
+    image: haproxy:3.0-alpine
+    container_name: sub2api-pgproxy
+    restart: unless-stopped
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+  sub2api:
+    image: ${SUB2API_IMAGE}
+    container_name: sub2api
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${SERVER_PORT:-8080}:8080"
+    volumes:
+      - sub2api_data:/app/data
+    env_file:
+      - .env
+    environment:
+      AUTO_SETUP: "true"
+    depends_on:
+      - pgproxy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  sub2api_data:

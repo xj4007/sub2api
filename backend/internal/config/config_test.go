@@ -563,16 +563,20 @@ func TestConfigAddressHelpers(t *testing.T) {
 	}
 
 	dbCfg := DatabaseConfig{
-		Host:     "localhost",
-		Port:     5432,
-		User:     "postgres",
-		Password: "",
-		DBName:   "sub2api",
-		SSLMode:  "disable",
+		Host:               "localhost",
+		Port:               5432,
+		User:               "postgres",
+		Password:           "",
+		DBName:             "sub2api",
+		SSLMode:            "disable",
+		TargetSessionAttrs: "read-write",
 	}
 	if !strings.Contains(dbCfg.DSN(), "password=") {
 	} else {
 		t.Fatalf("DatabaseConfig.DSN() should not include password when empty")
+	}
+	if !strings.Contains(dbCfg.DSN(), "target_session_attrs=read-write") {
+		t.Fatalf("DatabaseConfig.DSN() should include target_session_attrs when configured")
 	}
 
 	dbCfg.Password = "secret"
@@ -595,6 +599,11 @@ func TestConfigAddressHelpers(t *testing.T) {
 	redis := RedisConfig{Host: "redis", Port: 6379}
 	if redis.Address() != "redis:6379" {
 		t.Fatalf("RedisConfig.Address() = %q", redis.Address())
+	}
+
+	redisSentinel := RedisConfig{SentinelAddrs: "10.0.0.1:26379, 10.0.0.2:26379 ,,10.0.0.3:26379"}
+	if got := redisSentinel.SentinelAddresses(); len(got) != 3 || got[0] != "10.0.0.1:26379" || got[1] != "10.0.0.2:26379" || got[2] != "10.0.0.3:26379" {
+		t.Fatalf("RedisConfig.SentinelAddresses() = %#v", got)
 	}
 }
 

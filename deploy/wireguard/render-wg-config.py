@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+if len(sys.argv) != 4:
+    raise SystemExit("usage: render-wg-config.py <inventory.json> <keys.json> <node-name>")
+
+inventory = json.loads(Path(sys.argv[1]).read_text())
+keys = json.loads(Path(sys.argv[2]).read_text())
+node_name = sys.argv[3]
+
+node = inventory["nodes"][node_name]
+listen_port = inventory["listen_port"]
+
+print("[Interface]")
+print(f"Address = {node['wg_ip']}/24")
+print(f"ListenPort = {listen_port}")
+print(f"PrivateKey = {keys[node_name]['private_key']}")
+print("SaveConfig = true")
+
+for peer_name, peer in inventory["nodes"].items():
+    if peer_name == node_name:
+        continue
+    print()
+    print("[Peer]")
+    print(f"PublicKey = {keys[peer_name]['public_key']}")
+    print(f"AllowedIPs = {peer['wg_ip']}/32")
+    print(f"Endpoint = {peer['public_ip']}:{listen_port}")
+    print("PersistentKeepalive = 25")
