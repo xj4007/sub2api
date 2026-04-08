@@ -94,6 +94,54 @@
 - 避免服务器拉依赖慢/失败
 - 可以明确保证部署的是你本地当前代码
 
+### 发布说明
+
+从现在开始，这两个文档按下面的方式来使用：
+
+- `deploy/HA_DEPLOYMENT_CN.md`：总手册。主要负责讲清楚整体架构、部署拓扑、HA、WireGuard、数据导入、故障切换这些背景信息。
+- `deploy/RELEASE_RUNBOOK_CN.md`：发布手册。只要你准备上线、做 canary、全量发布、回滚，就看这个文档。
+
+所以请记住这条最重要的规则：
+
+> **凡是发布相关的操作，一律以 `deploy/RELEASE_RUNBOOK_CN.md` 为准。**
+
+这里说的“发布相关”，包括：
+
+- 日常代码发布
+- 带 migration 的发布
+- 单节点 canary
+- 全量发布
+- 回滚
+
+你可以把它简单理解成：
+
+- `HA_DEPLOYMENT_CN.md` 是“整体说明书”
+- `RELEASE_RUNBOOK_CN.md` 是“真正操作时要照着走的步骤手册”
+
+以后如果你只是想了解：
+
+- 这套架构是怎么搭的
+- PostgreSQL / Redis / WireGuard 是怎么工作的
+- 故障切换是怎么演练的
+- 数据是怎么导入的
+
+那就看：
+
+- `deploy/HA_DEPLOYMENT_CN.md`
+
+如果你准备实际发布：
+
+- 拉新代码
+- 看 migration
+- 构建镜像
+- canary
+- 全量
+- 回滚
+
+那就直接看：
+
+- `deploy/RELEASE_RUNBOOK_CN.md`
+
 ---
 
 ## 3. 本次实际用到的文件
@@ -674,193 +722,22 @@ done
 
 ---
 
-## 14. 生产库导入到当前 PostgreSQL 集群的标准流程
+## 14. 生产库导入说明
 
-这次已经实际执行过一遍，后续如需重复导入，建议按下面顺序。
+生产库导入相关内容已经单独抽离到：
 
-### 14.1 先确认生产库信息
+- `deploy/DB_IMPORT_ONCE_CN.md`
 
-生产数据库机器：
+原因是：
 
-- IP：`43.154.19.173`
-- SSH 端口：`22`
-- 用户：`root`
-- 密码：`XIANjian4SANyun`
-- 路径：`/www/dk_project/dk_app/sub2api-db`
-- PostgreSQL 容器名：`sub2api-postgres`
+- 这部分属于**一次性操作**
+- 正常情况下，后续不会频繁重复执行
+- 继续放在主手册里，会让 `HA_DEPLOYMENT_CN.md` 显得过重
 
-生产库当前 `.env` 里：
+所以从现在开始：
 
-- `POSTGRES_USER=sub2api`
-- `POSTGRES_PASSWORD=XIANjian4SANyun`
-- `POSTGRES_DB=sub2api`
-
-### 14.2 先看 migration 差异，不要直接导
-
-本次实际情况：
-
-- 生产库：`99` 条 migration
-- 当前代码/当前集群：`110` 条 migration
-
-所以正确做法不是“导入完就结束”，而是：
-
-1. 先把生产库恢复到临时库
-2. 用当前版本应用验证能否自动补迁移到最新
-3. 验证通过后，再正式替换在线库
-
-### 14.3 生产库导出
-
-在部署机本地执行：
-
-```bash
-ssh root@43.154.19.173 'docker exec sub2api-postgres pg_dump -U sub2api -d sub2api --format=custom --no-owner --no-privileges' > /tmp/sub2api-prod.dump
-```
-
-### 14.4 先备份当前集群数据库
-
-在部署机本地执行：
-
-```bash
-docker run --rm --network host \
-  -e PGPASSWORD='XIANjian4SANyun' \
-  postgres:18-alpine \
-  pg_dump -h 154.12.80.55 -U sub2api -d sub2api --format=custom --no-owner --no-privileges \
-  > /tmp/sub2api-cluster-before-prod-import.dump
-```
-
-### 14.5 先做临时恢复演练（强烈建议）
-
-先创建临时库：
-
-```bash
-docker run --rm --network host -e PGPASSWORD='XIANjian4SANyun' postgres:18-alpine \
-  psql -h 154.12.80.55 -U sub2api -d postgres -c "DROP DATABASE IF EXISTS sub2api_import_check;"
-
-docker run --rm --network host -e PGPASSWORD='XIANjian4SANyun' postgres:18-alpine \
-  psql -h 154.12.80.55 -U sub2api -d postgres -c "CREATE DATABASE sub2api_import_check;"
-```
-
-恢复到临时库：
-
-```bash
-docker run --rm --network host \
-  -e PGPASSWORD='XIANjian4SANyun' \
-  -v /tmp/sub2api-prod.dump:/dump/sub2api-prod.dump:ro \
-  postgres:18-alpine \
-  pg_restore -h 154.12.80.55 -U sub2api -d sub2api_import_check --clean --if-exists --no-owner --no-privileges /dump/sub2api-prod.dump
-```
-
-然后用**当前版本应用镜像**连这个临时库启动一次，验证 migration 能从 `99` 补到 `110`。
-
-本次已经实测通过。
-
-### 14.6 正式导入在线库
-
-#### 第一步：停应用
-
-```bash
-for host in 154.12.21.52 45.192.105.162 156.225.20.29; do
-  ssh root@$host 'docker stop sub2api'
-done
-```
-
-#### 第二步：保留旧库快照并创建新库
-
-在当前主库（`154.12.80.55`）执行：
-
-```bash
-docker exec sub2api-patroni psql -U sub2api -d postgres -c "select pid, usename, application_name, client_addr, state from pg_stat_activity where datname='sub2api';"
-docker exec sub2api-patroni psql -U sub2api -d postgres -c "select pg_terminate_backend(pid) from pg_stat_activity where datname='sub2api' and pid <> pg_backend_pid();"
-docker exec sub2api-patroni psql -U sub2api -d postgres -c "ALTER DATABASE sub2api RENAME TO sub2api_before_prod_import_20260407;"
-docker exec sub2api-patroni psql -U sub2api -d postgres -c "CREATE DATABASE sub2api;"
-```
-
-#### 第三步：把生产 dump 恢复到新的 `sub2api`
-
-```bash
-docker run --rm --network host \
-  -e PGPASSWORD='XIANjian4SANyun' \
-  -v /tmp/sub2api-prod.dump:/dump/sub2api-prod.dump:ro \
-  postgres:18-alpine \
-  pg_restore -h 154.12.80.55 -U sub2api -d sub2api --no-owner --no-privileges /dump/sub2api-prod.dump
-```
-
-#### 第四步：先启动一台应用补迁移
-
-先启动服务器4：
-
-```bash
-ssh root@154.12.21.52 'docker start sub2api'
-```
-
-然后检查：
-
-```bash
-ssh root@154.12.80.55 'docker exec sub2api-patroni psql -U sub2api -d sub2api -c "select count(*) from schema_migrations;"'
-```
-
-本次结果：
-
-- 导入后初始是 `99`
-- 启动当前版本 `sub2api` 后，自动补到 `110`
-
-#### 第五步：再启动另外两台应用
-
-```bash
-ssh root@45.192.105.162 'docker start sub2api'
-ssh root@156.225.20.29 'docker start sub2api'
-```
-
-### 14.7 导入后的验证
-
-#### 验证 PostgreSQL 主从复制
-
-```bash
-ssh root@154.12.80.55 'docker exec sub2api-patroni psql -U sub2api -d postgres -c "select client_addr, state, sync_state, application_name from pg_stat_replication;"'
-```
-
-期望：`db1` / `db3` 都是 `streaming`
-
-#### 验证应用健康
-
-```bash
-for host in 154.12.21.52 45.192.105.162 156.225.20.29; do
-  ssh root@$host 'docker ps --format "table {{.Names}}\t{{.Status}}" | grep sub2api && curl -fsS http://127.0.0.1:8080/health'
-done
-```
-
-#### 验证管理员登录
-
-```bash
-python3 - <<'PY'
-import json, urllib.request
-url='http://154.12.21.52:8080/api/v1/auth/login'
-data=json.dumps({'email':'727965481@qq.com','password':'XIANjian4'}).encode()
-req=urllib.request.Request(url, data=data, headers={'Content-Type':'application/json'})
-with urllib.request.urlopen(req, timeout=15) as resp:
-    print(resp.status)
-    print(resp.read().decode())
-PY
-```
-
-本次已验证返回 `200`。
-
-### 14.8 本次导入后的实际结果
-
-- 生产数据已导入当前 HA PostgreSQL 集群
-- `users` 数量从原测试数据 `1` 变为生产数据 `8`
-- migration 从 `99` 自动补齐到 `110`
-- 三台应用恢复 healthy
-- 管理员 `727965481@qq.com / XIANjian4` 登录成功
-
-### 14.9 本次导入后保留的回滚点
-
-当前还保留：
-
-- 数据库回滚点：`sub2api_before_prod_import_20260407`
-- 本地 dump 回滚文件：`/tmp/sub2api-cluster-before-prod-import.dump`
-
-如果以后确认完全不需要回滚，再考虑删除。
+- 如果你要看 PostgreSQL HA、WireGuard、故障切换、整体部署结构，就继续看 `deploy/HA_DEPLOYMENT_CN.md`
+- 如果你要回看“当时生产库是怎么导进来的”，就看 `deploy/DB_IMPORT_ONCE_CN.md`
 
 ---
 
