@@ -24,7 +24,7 @@ func (s *RedeemCodeRepoSuite) SetupTest() {
 	s.ctx = context.Background()
 	tx := testEntTx(s.T())
 	s.client = tx.Client()
-	s.repo = NewRedeemCodeRepository(s.client).(*redeemCodeRepository)
+	s.repo = NewRedeemCodeRepository(s.client, nil).(*redeemCodeRepository)
 }
 
 func TestRedeemCodeRepoSuite(t *testing.T) {
