@@ -132,9 +132,12 @@ func appendRawUsageLogModelQueryFilter(query string, args []any, model string) (
 }
 
 type usageLogRepository struct {
-	client *dbent.Client
-	sql    sqlExecutor
-	db     *sql.DB
+	client       *dbent.Client
+	sql          sqlExecutor
+	db           *sql.DB
+	readerClient *dbent.Client
+	readerSQL    sqlExecutor
+	readerDB     *sql.DB
 
 	createBatchOnce     sync.Once
 	createBatchCh       chan usageLogCreateRequest
@@ -205,7 +208,10 @@ const (
 	usageLogCreateStateCanceled
 )
 
-func NewUsageLogRepository(client *dbent.Client, sqlDB *sql.DB) service.UsageLogRepository {
+func NewUsageLogRepository(client *dbent.Client, sqlDB *sql.DB, readerClient *ReaderEntClient, readerDB *ReaderSQLDB) service.UsageLogRepository {
+	if readerClient != nil && readerClient.Client != nil && readerDB != nil && readerDB.DB != nil {
+		return newUsageLogRepositoryWithReadReplica(client, sqlDB, readerClient.Client, readerDB.DB)
+	}
 	return newUsageLogRepositoryWithSQL(client, sqlDB)
 }
 
@@ -219,27 +225,49 @@ func newUsageLogRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *usage
 	return repo
 }
 
+func newUsageLogRepositoryWithReadReplica(writerClient *dbent.Client, writerSQL sqlExecutor, readerClient *dbent.Client, readerSQL sqlExecutor) *usageLogRepository {
+	repo := newUsageLogRepositoryWithSQL(writerClient, writerSQL)
+	repo.readerClient = readerClient
+	repo.readerSQL = readerSQL
+	if db, ok := readerSQL.(*sql.DB); ok {
+		repo.readerDB = db
+	}
+	return repo
+}
+
+func (r *usageLogRepository) readSQL() sqlExecutor {
+	if r != nil && r.readerSQL != nil {
+		return r.readerSQL
+	}
+	if r == nil {
+		return nil
+	}
+	return r.sql
+}
+
+func (r *usageLogRepository) readDB() *sql.DB {
+	if r != nil && r.readerDB != nil {
+		return r.readerDB
+	}
+	if r == nil {
+		return nil
+	}
+	return r.db
+}
+
+func (r *usageLogRepository) readClient() *dbent.Client {
+	if r != nil && r.readerClient != nil {
+		return r.readerClient
+	}
+	if r == nil {
+		return nil
+	}
+	return r.client
+}
+
 // getPerformanceStats 获取 RPM 和 TPM（近5分钟平均值，可选按用户过滤）
 func (r *usageLogRepository) getPerformanceStats(ctx context.Context, userID int64) (rpm, tpm int64, err error) {
-	fiveMinutesAgo := time.Now().Add(-5 * time.Minute)
-	query := `
-		SELECT
-			COUNT(*) as request_count,
-			COALESCE(SUM(input_tokens + output_tokens), 0) as token_count
-		FROM usage_logs
-		WHERE created_at >= $1`
-	args := []any{fiveMinutesAgo}
-	if userID > 0 {
-		query += " AND user_id = $2"
-		args = append(args, userID)
-	}
-
-	var requestCount int64
-	var tokenCount int64
-	if err := scanSingleRow(ctx, r.sql, query, args, &requestCount, &tokenCount); err != nil {
-		return 0, 0, err
-	}
-	return requestCount / 5, tokenCount / 5, nil
+	return r.getPerformanceStatsWithSQL(ctx, r.sql, userID)
 }
 
 func (r *usageLogRepository) Create(ctx context.Context, log *service.UsageLog) (bool, error) {
@@ -1343,11 +1371,11 @@ func (r *usageLogRepository) GetByID(ctx context.Context, id int64) (log *servic
 }
 
 func (r *usageLogRepository) ListByUser(ctx context.Context, userID int64, params pagination.PaginationParams) ([]service.UsageLog, *pagination.PaginationResult, error) {
-	return r.listUsageLogsWithPagination(ctx, "WHERE user_id = $1", []any{userID}, params)
+	return r.listUsageLogsWithPaginationOnSQL(ctx, r.sql, "WHERE user_id = $1", []any{userID}, params)
 }
 
 func (r *usageLogRepository) ListByAPIKey(ctx context.Context, apiKeyID int64, params pagination.PaginationParams) ([]service.UsageLog, *pagination.PaginationResult, error) {
-	return r.listUsageLogsWithPagination(ctx, "WHERE api_key_id = $1", []any{apiKeyID}, params)
+	return r.listUsageLogsWithPaginationOnSQL(ctx, r.sql, "WHERE api_key_id = $1", []any{apiKeyID}, params)
 }
 
 // UserStats 用户使用统计
@@ -1679,12 +1707,34 @@ func (r *usageLogRepository) fillDashboardUsageStatsFromUsageLogs(ctx context.Co
 }
 
 func (r *usageLogRepository) ListByAccount(ctx context.Context, accountID int64, params pagination.PaginationParams) ([]service.UsageLog, *pagination.PaginationResult, error) {
-	return r.listUsageLogsWithPagination(ctx, "WHERE account_id = $1", []any{accountID}, params)
+	return r.listUsageLogsWithPaginationOnSQL(ctx, r.sql, "WHERE account_id = $1", []any{accountID}, params)
+}
+
+func (r *usageLogRepository) getPerformanceStatsWithSQL(ctx context.Context, sqlq sqlExecutor, userID int64) (rpm, tpm int64, err error) {
+	fiveMinutesAgo := time.Now().Add(-5 * time.Minute)
+	query := `
+		SELECT
+			COUNT(*) as request_count,
+			COALESCE(SUM(input_tokens + output_tokens), 0) as token_count
+		FROM usage_logs
+		WHERE created_at >= $1`
+	args := []any{fiveMinutesAgo}
+	if userID > 0 {
+		query += " AND user_id = $2"
+		args = append(args, userID)
+	}
+
+	var requestCount int64
+	var tokenCount int64
+	if err := scanSingleRow(ctx, sqlq, query, args, &requestCount, &tokenCount); err != nil {
+		return 0, 0, err
+	}
+	return requestCount / 5, tokenCount / 5, nil
 }
 
 func (r *usageLogRepository) ListByUserAndTimeRange(ctx context.Context, userID int64, startTime, endTime time.Time) ([]service.UsageLog, *pagination.PaginationResult, error) {
 	query := "SELECT " + usageLogSelectColumns + " FROM usage_logs WHERE user_id = $1 AND created_at >= $2 AND created_at < $3 ORDER BY id DESC LIMIT 10000"
-	logs, err := r.queryUsageLogs(ctx, query, userID, startTime, endTime)
+	logs, err := r.queryUsageLogsWithSQL(ctx, r.sql, query, userID, startTime, endTime)
 	return logs, nil, err
 }
 
@@ -1930,13 +1980,13 @@ func resolveUsageStatsTimezone() string {
 
 func (r *usageLogRepository) ListByAPIKeyAndTimeRange(ctx context.Context, apiKeyID int64, startTime, endTime time.Time) ([]service.UsageLog, *pagination.PaginationResult, error) {
 	query := "SELECT " + usageLogSelectColumns + " FROM usage_logs WHERE api_key_id = $1 AND created_at >= $2 AND created_at < $3 ORDER BY id DESC LIMIT 10000"
-	logs, err := r.queryUsageLogs(ctx, query, apiKeyID, startTime, endTime)
+	logs, err := r.queryUsageLogsWithSQL(ctx, r.sql, query, apiKeyID, startTime, endTime)
 	return logs, nil, err
 }
 
 func (r *usageLogRepository) ListByAccountAndTimeRange(ctx context.Context, accountID int64, startTime, endTime time.Time) ([]service.UsageLog, *pagination.PaginationResult, error) {
 	query := "SELECT " + usageLogSelectColumns + " FROM usage_logs WHERE account_id = $1 AND created_at >= $2 AND created_at < $3 ORDER BY id DESC LIMIT 10000"
-	logs, err := r.queryUsageLogs(ctx, query, accountID, startTime, endTime)
+	logs, err := r.queryUsageLogsWithSQL(ctx, r.sql, query, accountID, startTime, endTime)
 	return logs, nil, err
 }
 
@@ -2139,6 +2189,7 @@ type APIKeyUsageTrendPoint = usagestats.APIKeyUsageTrendPoint
 
 // GetAPIKeyUsageTrend returns usage trend data grouped by API key and date
 func (r *usageLogRepository) GetAPIKeyUsageTrend(ctx context.Context, startTime, endTime time.Time, granularity string, limit int) (results []APIKeyUsageTrendPoint, err error) {
+	readSQL := r.readSQL()
 	dateFormat := safeDateFormat(granularity)
 
 	query := fmt.Sprintf(`
@@ -2164,7 +2215,7 @@ func (r *usageLogRepository) GetAPIKeyUsageTrend(ctx context.Context, startTime,
 		ORDER BY date ASC, tokens DESC
 	`, dateFormat)
 
-	rows, err := r.sql.QueryContext(ctx, query, startTime, endTime, limit, startTime, endTime)
+	rows, err := readSQL.QueryContext(ctx, query, startTime, endTime, limit, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
@@ -2194,6 +2245,7 @@ func (r *usageLogRepository) GetAPIKeyUsageTrend(ctx context.Context, startTime,
 
 // GetUserUsageTrend returns usage trend data grouped by user and date
 func (r *usageLogRepository) GetUserUsageTrend(ctx context.Context, startTime, endTime time.Time, granularity string, limit int) (results []UserUsageTrendPoint, err error) {
+	readSQL := r.readSQL()
 	dateFormat := safeDateFormat(granularity)
 
 	query := fmt.Sprintf(`
@@ -2222,7 +2274,7 @@ func (r *usageLogRepository) GetUserUsageTrend(ctx context.Context, startTime, e
 		ORDER BY date ASC, tokens DESC
 	`, dateFormat)
 
-	rows, err := r.sql.QueryContext(ctx, query, startTime, endTime, limit, startTime, endTime)
+	rows, err := readSQL.QueryContext(ctx, query, startTime, endTime, limit, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
@@ -2255,6 +2307,7 @@ func (r *usageLogRepository) GetUserSpendingRanking(ctx context.Context, startTi
 	if limit <= 0 {
 		limit = 12
 	}
+	readSQL := r.readSQL()
 
 	query := `
 		WITH user_spend AS (
@@ -2296,7 +2349,7 @@ func (r *usageLogRepository) GetUserSpendingRanking(ctx context.Context, startTi
 		ORDER BY actual_cost DESC, tokens DESC, user_id ASC
 	`
 
-	rows, err := r.sql.QueryContext(ctx, query, startTime, endTime, limit)
+	rows, err := readSQL.QueryContext(ctx, query, startTime, endTime, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -2337,11 +2390,12 @@ type UserDashboardStats = usagestats.UserDashboardStats
 func (r *usageLogRepository) GetUserDashboardStats(ctx context.Context, userID int64) (*UserDashboardStats, error) {
 	stats := &UserDashboardStats{}
 	today := timezone.Today()
+	readSQL := r.readSQL()
 
 	// API Key 统计
 	if err := scanSingleRow(
 		ctx,
-		r.sql,
+		readSQL,
 		"SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND deleted_at IS NULL",
 		[]any{userID},
 		&stats.TotalAPIKeys,
@@ -2350,7 +2404,7 @@ func (r *usageLogRepository) GetUserDashboardStats(ctx context.Context, userID i
 	}
 	if err := scanSingleRow(
 		ctx,
-		r.sql,
+		readSQL,
 		"SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND status = $2 AND deleted_at IS NULL",
 		[]any{userID, service.StatusActive},
 		&stats.ActiveAPIKeys,
@@ -2374,7 +2428,7 @@ func (r *usageLogRepository) GetUserDashboardStats(ctx context.Context, userID i
 	`
 	if err := scanSingleRow(
 		ctx,
-		r.sql,
+		readSQL,
 		totalStatsQuery,
 		[]any{userID},
 		&stats.TotalRequests,
@@ -2421,7 +2475,7 @@ func (r *usageLogRepository) GetUserDashboardStats(ctx context.Context, userID i
 	stats.TodayTokens = stats.TodayInputTokens + stats.TodayOutputTokens + stats.TodayCacheCreationTokens + stats.TodayCacheReadTokens
 
 	// 性能指标：RPM 和 TPM（最近1分钟，仅统计该用户的请求）
-	rpm, tpm, err := r.getPerformanceStats(ctx, userID)
+	rpm, tpm, err := r.getPerformanceStatsWithSQL(ctx, readSQL, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -2433,6 +2487,10 @@ func (r *usageLogRepository) GetUserDashboardStats(ctx context.Context, userID i
 
 // getPerformanceStatsByAPIKey 获取指定 API Key 的 RPM 和 TPM（近5分钟平均值）
 func (r *usageLogRepository) getPerformanceStatsByAPIKey(ctx context.Context, apiKeyID int64) (rpm, tpm int64, err error) {
+	return r.getPerformanceStatsByAPIKeyWithSQL(ctx, r.sql, apiKeyID)
+}
+
+func (r *usageLogRepository) getPerformanceStatsByAPIKeyWithSQL(ctx context.Context, sqlq sqlExecutor, apiKeyID int64) (rpm, tpm int64, err error) {
 	fiveMinutesAgo := time.Now().Add(-5 * time.Minute)
 	query := `
 		SELECT
@@ -2444,7 +2502,7 @@ func (r *usageLogRepository) getPerformanceStatsByAPIKey(ctx context.Context, ap
 
 	var requestCount int64
 	var tokenCount int64
-	if err := scanSingleRow(ctx, r.sql, query, args, &requestCount, &tokenCount); err != nil {
+	if err := scanSingleRow(ctx, sqlq, query, args, &requestCount, &tokenCount); err != nil {
 		return 0, 0, err
 	}
 	return requestCount / 5, tokenCount / 5, nil
@@ -2454,6 +2512,7 @@ func (r *usageLogRepository) getPerformanceStatsByAPIKey(ctx context.Context, ap
 func (r *usageLogRepository) GetAPIKeyDashboardStats(ctx context.Context, apiKeyID int64) (*UserDashboardStats, error) {
 	stats := &UserDashboardStats{}
 	today := timezone.Today()
+	readSQL := r.readSQL()
 
 	// API Key 维度不需要统计 key 数量，设为 1
 	stats.TotalAPIKeys = 1
@@ -2475,7 +2534,7 @@ func (r *usageLogRepository) GetAPIKeyDashboardStats(ctx context.Context, apiKey
 	`
 	if err := scanSingleRow(
 		ctx,
-		r.sql,
+		readSQL,
 		totalStatsQuery,
 		[]any{apiKeyID},
 		&stats.TotalRequests,
@@ -2506,7 +2565,7 @@ func (r *usageLogRepository) GetAPIKeyDashboardStats(ctx context.Context, apiKey
 	`
 	if err := scanSingleRow(
 		ctx,
-		r.sql,
+		readSQL,
 		todayStatsQuery,
 		[]any{apiKeyID, today},
 		&stats.TodayRequests,
@@ -2522,7 +2581,7 @@ func (r *usageLogRepository) GetAPIKeyDashboardStats(ctx context.Context, apiKey
 	stats.TodayTokens = stats.TodayInputTokens + stats.TodayOutputTokens + stats.TodayCacheCreationTokens + stats.TodayCacheReadTokens
 
 	// 性能指标：RPM 和 TPM（最近5分钟，按 API Key 过滤）
-	rpm, tpm, err := r.getPerformanceStatsByAPIKey(ctx, apiKeyID)
+	rpm, tpm, err := r.getPerformanceStatsByAPIKeyWithSQL(ctx, readSQL, apiKeyID)
 	if err != nil {
 		return nil, err
 	}
@@ -2534,6 +2593,7 @@ func (r *usageLogRepository) GetAPIKeyDashboardStats(ctx context.Context, apiKey
 
 // GetUserUsageTrendByUserID 获取指定用户的使用趋势
 func (r *usageLogRepository) GetUserUsageTrendByUserID(ctx context.Context, userID int64, startTime, endTime time.Time, granularity string) (results []TrendDataPoint, err error) {
+	readSQL := r.readSQL()
 	dateFormat := safeDateFormat(granularity)
 
 	query := fmt.Sprintf(`
@@ -2553,7 +2613,7 @@ func (r *usageLogRepository) GetUserUsageTrendByUserID(ctx context.Context, user
 		ORDER BY date ASC
 	`, dateFormat)
 
-	rows, err := r.sql.QueryContext(ctx, query, userID, startTime, endTime)
+	rows, err := readSQL.QueryContext(ctx, query, userID, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
@@ -2575,6 +2635,7 @@ func (r *usageLogRepository) GetUserUsageTrendByUserID(ctx context.Context, user
 
 // GetUserModelStats 获取指定用户的模型统计
 func (r *usageLogRepository) GetUserModelStats(ctx context.Context, userID int64, startTime, endTime time.Time) (results []ModelStat, err error) {
+	readSQL := r.readSQL()
 	query := `
 		SELECT
 			model,
@@ -2592,7 +2653,7 @@ func (r *usageLogRepository) GetUserModelStats(ctx context.Context, userID int64
 		ORDER BY total_tokens DESC
 	`
 
-	rows, err := r.sql.QueryContext(ctx, query, userID, startTime, endTime)
+	rows, err := readSQL.QueryContext(ctx, query, userID, startTime, endTime)
 	if err != nil {
 		return nil, err
 	}
@@ -2662,9 +2723,9 @@ func (r *usageLogRepository) ListWithFilters(ctx context.Context, params paginat
 		err  error
 	)
 	if shouldUseFastUsageLogTotal(filters) {
-		logs, page, err = r.listUsageLogsWithFastPagination(ctx, whereClause, args, params)
+		logs, page, err = r.listUsageLogsWithFastPaginationOnSQL(ctx, r.sql, whereClause, args, params)
 	} else {
-		logs, page, err = r.listUsageLogsWithPagination(ctx, whereClause, args, params)
+		logs, page, err = r.listUsageLogsWithPaginationOnSQL(ctx, r.sql, whereClause, args, params)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -2712,6 +2773,7 @@ func normalizePositiveInt64IDs(ids []int64) []int64 {
 // GetBatchUserUsageStats gets today and total actual_cost for multiple users within a time range.
 // If startTime is zero, defaults to 30 days ago.
 func (r *usageLogRepository) GetBatchUserUsageStats(ctx context.Context, userIDs []int64, startTime, endTime time.Time) (map[int64]*BatchUserUsageStats, error) {
+	readSQL := r.readSQL()
 	result := make(map[int64]*BatchUserUsageStats)
 	normalizedUserIDs := normalizePositiveInt64IDs(userIDs)
 	if len(normalizedUserIDs) == 0 {
@@ -2741,7 +2803,7 @@ func (r *usageLogRepository) GetBatchUserUsageStats(ctx context.Context, userIDs
 		GROUP BY user_id
 	`
 	today := timezone.Today()
-	rows, err := r.sql.QueryContext(ctx, query, pq.Array(normalizedUserIDs), startTime, endTime, today)
+	rows, err := readSQL.QueryContext(ctx, query, pq.Array(normalizedUserIDs), startTime, endTime, today)
 	if err != nil {
 		return nil, err
 	}
@@ -2774,6 +2836,7 @@ type BatchAPIKeyUsageStats = usagestats.BatchAPIKeyUsageStats
 // GetBatchAPIKeyUsageStats gets today and total actual_cost for multiple API keys within a time range.
 // If startTime is zero, defaults to 30 days ago.
 func (r *usageLogRepository) GetBatchAPIKeyUsageStats(ctx context.Context, apiKeyIDs []int64, startTime, endTime time.Time) (map[int64]*BatchAPIKeyUsageStats, error) {
+	readSQL := r.readSQL()
 	result := make(map[int64]*BatchAPIKeyUsageStats)
 	normalizedAPIKeyIDs := normalizePositiveInt64IDs(apiKeyIDs)
 	if len(normalizedAPIKeyIDs) == 0 {
@@ -2803,7 +2866,7 @@ func (r *usageLogRepository) GetBatchAPIKeyUsageStats(ctx context.Context, apiKe
 		GROUP BY api_key_id
 	`
 	today := timezone.Today()
-	rows, err := r.sql.QueryContext(ctx, query, pq.Array(normalizedAPIKeyIDs), startTime, endTime, today)
+	rows, err := readSQL.QueryContext(ctx, query, pq.Array(normalizedAPIKeyIDs), startTime, endTime, today)
 	if err != nil {
 		return nil, err
 	}
@@ -2832,8 +2895,9 @@ func (r *usageLogRepository) GetBatchAPIKeyUsageStats(ctx context.Context, apiKe
 
 // GetUsageTrendWithFilters returns usage trend data with optional filters
 func (r *usageLogRepository) GetUsageTrendWithFilters(ctx context.Context, startTime, endTime time.Time, granularity string, userID, apiKeyID, accountID, groupID int64, model string, requestType *int16, stream *bool, billingType *int8) (results []TrendDataPoint, err error) {
+	readSQL := r.readSQL()
 	if shouldUsePreaggregatedTrend(granularity, userID, apiKeyID, accountID, groupID, model, requestType, stream, billingType) {
-		aggregated, aggregatedErr := r.getUsageTrendFromAggregates(ctx, startTime, endTime, granularity)
+		aggregated, aggregatedErr := r.getUsageTrendFromAggregates(ctx, readSQL, startTime, endTime, granularity)
 		if aggregatedErr == nil && len(aggregated) > 0 {
 			return aggregated, nil
 		}
@@ -2881,7 +2945,7 @@ func (r *usageLogRepository) GetUsageTrendWithFilters(ctx context.Context, start
 	}
 	query += " GROUP BY date ORDER BY date ASC"
 
-	rows, err := r.sql.QueryContext(ctx, query, args...)
+	rows, err := readSQL.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2915,7 +2979,7 @@ func shouldUsePreaggregatedTrend(granularity string, userID, apiKeyID, accountID
 		billingType == nil
 }
 
-func (r *usageLogRepository) getUsageTrendFromAggregates(ctx context.Context, startTime, endTime time.Time, granularity string) (results []TrendDataPoint, err error) {
+func (r *usageLogRepository) getUsageTrendFromAggregates(ctx context.Context, sqlq sqlExecutor, startTime, endTime time.Time, granularity string) (results []TrendDataPoint, err error) {
 	dateFormat := safeDateFormat(granularity)
 	query := ""
 	args := []any{startTime, endTime}
@@ -2957,7 +3021,7 @@ func (r *usageLogRepository) getUsageTrendFromAggregates(ctx context.Context, st
 		return nil, nil
 	}
 
-	rows, err := r.sql.QueryContext(ctx, query, args...)
+	rows, err := sqlq.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2987,6 +3051,7 @@ func (r *usageLogRepository) GetModelStatsWithFiltersBySource(ctx context.Contex
 }
 
 func (r *usageLogRepository) getModelStatsWithFiltersBySource(ctx context.Context, startTime, endTime time.Time, userID, apiKeyID, accountID, groupID int64, requestType *int16, stream *bool, billingType *int8, source string) (results []ModelStat, err error) {
+	readSQL := r.readSQL()
 	actualCostExpr := "COALESCE(SUM(actual_cost), 0) as actual_cost"
 	// 当仅按 account_id 聚合时，实际费用使用账号倍率（total_cost * account_rate_multiplier）。
 	if accountID > 0 && userID == 0 && apiKeyID == 0 {
@@ -3033,7 +3098,7 @@ func (r *usageLogRepository) getModelStatsWithFiltersBySource(ctx context.Contex
 	}
 	query += fmt.Sprintf(" GROUP BY %s ORDER BY total_tokens DESC", modelExpr)
 
-	rows, err := r.sql.QueryContext(ctx, query, args...)
+	rows, err := readSQL.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -3055,6 +3120,7 @@ func (r *usageLogRepository) getModelStatsWithFiltersBySource(ctx context.Contex
 
 // GetGroupStatsWithFilters returns group usage statistics with optional filters
 func (r *usageLogRepository) GetGroupStatsWithFilters(ctx context.Context, startTime, endTime time.Time, userID, apiKeyID, accountID, groupID int64, requestType *int16, stream *bool, billingType *int8) (results []usagestats.GroupStat, err error) {
+	readSQL := r.readSQL()
 	query := `
 		SELECT
 			COALESCE(ul.group_id, 0) as group_id,
@@ -3092,7 +3158,7 @@ func (r *usageLogRepository) GetGroupStatsWithFilters(ctx context.Context, start
 	}
 	query += " GROUP BY ul.group_id, g.name ORDER BY total_tokens DESC"
 
-	rows, err := r.sql.QueryContext(ctx, query, args...)
+	rows, err := readSQL.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -3126,6 +3192,7 @@ func (r *usageLogRepository) GetGroupStatsWithFilters(ctx context.Context, start
 
 // GetUserBreakdownStats returns per-user usage breakdown within a specific dimension.
 func (r *usageLogRepository) GetUserBreakdownStats(ctx context.Context, startTime, endTime time.Time, dim usagestats.UserBreakdownDimension, limit int) (results []usagestats.UserBreakdownItem, err error) {
+	readSQL := r.readSQL()
 	query := `
 		SELECT
 			COALESCE(ul.user_id, 0) as user_id,
@@ -3183,7 +3250,7 @@ func (r *usageLogRepository) GetUserBreakdownStats(ctx context.Context, startTim
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
 
-	rows, err := r.sql.QueryContext(ctx, query, args...)
+	rows, err := readSQL.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -3312,6 +3379,7 @@ func (r *usageLogRepository) GetGlobalStats(ctx context.Context, startTime, endT
 
 // GetStatsWithFilters gets usage statistics with optional filters
 func (r *usageLogRepository) GetStatsWithFilters(ctx context.Context, filters UsageLogFilters) (*UsageStats, error) {
+	readSQL := r.readSQL()
 	conditions := make([]string, 0, 9)
 	args := make([]any, 0, 9)
 
@@ -3368,7 +3436,7 @@ func (r *usageLogRepository) GetStatsWithFilters(ctx context.Context, filters Us
 	var totalAccountCost float64
 	if err := scanSingleRow(
 		ctx,
-		r.sql,
+		readSQL,
 		query,
 		args,
 		&stats.TotalRequests,
@@ -3431,6 +3499,7 @@ type AccountUsageStatsResponse = usagestats.AccountUsageStatsResponse
 type EndpointStat = usagestats.EndpointStat
 
 func (r *usageLogRepository) getEndpointStatsByColumnWithFilters(ctx context.Context, endpointColumn string, startTime, endTime time.Time, userID, apiKeyID, accountID, groupID int64, model string, requestType *int16, stream *bool, billingType *int8) (results []EndpointStat, err error) {
+	readSQL := r.readSQL()
 	actualCostExpr := "COALESCE(SUM(actual_cost), 0) as actual_cost"
 	if accountID > 0 && userID == 0 && apiKeyID == 0 {
 		actualCostExpr = "COALESCE(SUM(total_cost * COALESCE(account_rate_multiplier, 1)), 0) as actual_cost"
@@ -3472,7 +3541,7 @@ func (r *usageLogRepository) getEndpointStatsByColumnWithFilters(ctx context.Con
 	}
 	query += " GROUP BY endpoint ORDER BY requests DESC"
 
-	rows, err := r.sql.QueryContext(ctx, query, args...)
+	rows, err := readSQL.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -3498,6 +3567,7 @@ func (r *usageLogRepository) getEndpointStatsByColumnWithFilters(ctx context.Con
 }
 
 func (r *usageLogRepository) getEndpointPathStatsWithFilters(ctx context.Context, startTime, endTime time.Time, userID, apiKeyID, accountID, groupID int64, model string, requestType *int16, stream *bool, billingType *int8) (results []EndpointStat, err error) {
+	readSQL := r.readSQL()
 	actualCostExpr := "COALESCE(SUM(actual_cost), 0) as actual_cost"
 	if accountID > 0 && userID == 0 && apiKeyID == 0 {
 		actualCostExpr = "COALESCE(SUM(total_cost * COALESCE(account_rate_multiplier, 1)), 0) as actual_cost"
@@ -3543,7 +3613,7 @@ func (r *usageLogRepository) getEndpointPathStatsWithFilters(ctx context.Context
 	}
 	query += " GROUP BY endpoint ORDER BY requests DESC"
 
-	rows, err := r.sql.QueryContext(ctx, query, args...)
+	rows, err := readSQL.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -3762,9 +3832,13 @@ func (r *usageLogRepository) GetAccountUsageStats(ctx context.Context, accountID
 }
 
 func (r *usageLogRepository) listUsageLogsWithPagination(ctx context.Context, whereClause string, args []any, params pagination.PaginationParams) ([]service.UsageLog, *pagination.PaginationResult, error) {
+	return r.listUsageLogsWithPaginationOnSQL(ctx, r.readSQL(), whereClause, args, params)
+}
+
+func (r *usageLogRepository) listUsageLogsWithPaginationOnSQL(ctx context.Context, sqlq sqlExecutor, whereClause string, args []any, params pagination.PaginationParams) ([]service.UsageLog, *pagination.PaginationResult, error) {
 	countQuery := "SELECT COUNT(*) FROM usage_logs " + whereClause
 	var total int64
-	if err := scanSingleRow(ctx, r.sql, countQuery, args, &total); err != nil {
+	if err := scanSingleRow(ctx, sqlq, countQuery, args, &total); err != nil {
 		return nil, nil, err
 	}
 
@@ -3772,7 +3846,7 @@ func (r *usageLogRepository) listUsageLogsWithPagination(ctx context.Context, wh
 	offsetPos := len(args) + 2
 	listArgs := append(append([]any{}, args...), params.Limit(), params.Offset())
 	query := fmt.Sprintf("SELECT %s FROM usage_logs %s ORDER BY id DESC LIMIT $%d OFFSET $%d", usageLogSelectColumns, whereClause, limitPos, offsetPos)
-	logs, err := r.queryUsageLogs(ctx, query, listArgs...)
+	logs, err := r.queryUsageLogsWithSQL(ctx, sqlq, query, listArgs...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3780,6 +3854,10 @@ func (r *usageLogRepository) listUsageLogsWithPagination(ctx context.Context, wh
 }
 
 func (r *usageLogRepository) listUsageLogsWithFastPagination(ctx context.Context, whereClause string, args []any, params pagination.PaginationParams) ([]service.UsageLog, *pagination.PaginationResult, error) {
+	return r.listUsageLogsWithFastPaginationOnSQL(ctx, r.readSQL(), whereClause, args, params)
+}
+
+func (r *usageLogRepository) listUsageLogsWithFastPaginationOnSQL(ctx context.Context, sqlq sqlExecutor, whereClause string, args []any, params pagination.PaginationParams) ([]service.UsageLog, *pagination.PaginationResult, error) {
 	limit := params.Limit()
 	offset := params.Offset()
 
@@ -3788,7 +3866,7 @@ func (r *usageLogRepository) listUsageLogsWithFastPagination(ctx context.Context
 	listArgs := append(append([]any{}, args...), limit+1, offset)
 	query := fmt.Sprintf("SELECT %s FROM usage_logs %s ORDER BY id DESC LIMIT $%d OFFSET $%d", usageLogSelectColumns, whereClause, limitPos, offsetPos)
 
-	logs, err := r.queryUsageLogs(ctx, query, listArgs...)
+	logs, err := r.queryUsageLogsWithSQL(ctx, sqlq, query, listArgs...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3809,7 +3887,11 @@ func (r *usageLogRepository) listUsageLogsWithFastPagination(ctx context.Context
 }
 
 func (r *usageLogRepository) queryUsageLogs(ctx context.Context, query string, args ...any) (logs []service.UsageLog, err error) {
-	rows, err := r.sql.QueryContext(ctx, query, args...)
+	return r.queryUsageLogsWithSQL(ctx, r.readSQL(), query, args...)
+}
+
+func (r *usageLogRepository) queryUsageLogsWithSQL(ctx context.Context, sqlq sqlExecutor, query string, args ...any) (logs []service.UsageLog, err error) {
+	rows, err := sqlq.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

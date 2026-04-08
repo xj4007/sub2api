@@ -3,6 +3,7 @@
 package repository
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 	"time"
@@ -64,4 +65,29 @@ func TestBuildUsageLogBatchInsertQuery_UsesConflictDoNothing(t *testing.T) {
 
 	require.Contains(t, query, "ON CONFLICT (request_id, api_key_id) DO NOTHING")
 	require.NotContains(t, strings.ToUpper(query), "DO UPDATE")
+}
+
+func TestUsageLogRepositoryReadSQLUsesReaderWhenConfigured(t *testing.T) {
+	writer := &sql.DB{}
+	reader := &sql.DB{}
+	repo := &usageLogRepository{
+		sql:       writer,
+		db:        writer,
+		readerSQL: reader,
+		readerDB:  reader,
+	}
+
+	require.Same(t, reader, repo.readSQL())
+	require.Same(t, reader, repo.readDB())
+}
+
+func TestUsageLogRepositoryReadSQLFallsBackToWriter(t *testing.T) {
+	writer := &sql.DB{}
+	repo := &usageLogRepository{
+		sql: writer,
+		db:  writer,
+	}
+
+	require.Same(t, writer, repo.readSQL())
+	require.Same(t, writer, repo.readDB())
 }

@@ -818,6 +818,55 @@ func TestDatabaseDSNWithTimezone_WithPassword(t *testing.T) {
 	}
 }
 
+func TestReaderDSNWithTimezone_UsesReaderEndpoint(t *testing.T) {
+	d := &DatabaseConfig{
+		Host:                     "writer.internal",
+		Port:                     5432,
+		User:                     "sub2api",
+		Password:                 "secret",
+		DBName:                   "sub2api",
+		SSLMode:                  "disable",
+		TargetSessionAttrs:       "read-write",
+		ReaderHost:               "reader.internal",
+		ReaderPort:               5433,
+		ReaderTargetSessionAttrs: "read-only",
+	}
+
+	got := d.ReaderDSNWithTimezone("UTC")
+	if !strings.Contains(got, "host=reader.internal") {
+		t.Fatalf("ReaderDSNWithTimezone should use reader host: %q", got)
+	}
+	if !strings.Contains(got, "port=5433") {
+		t.Fatalf("ReaderDSNWithTimezone should use reader port: %q", got)
+	}
+	if !strings.Contains(got, "target_session_attrs=read-only") {
+		t.Fatalf("ReaderDSNWithTimezone should use reader target_session_attrs: %q", got)
+	}
+	if strings.Contains(got, "target_session_attrs=read-write") {
+		t.Fatalf("ReaderDSNWithTimezone should not reuse writer target_session_attrs: %q", got)
+	}
+}
+
+func TestReaderDSNWithTimezone_FallsBackToWriter(t *testing.T) {
+	d := &DatabaseConfig{
+		Host:               "writer.internal",
+		Port:               5432,
+		User:               "sub2api",
+		Password:           "secret",
+		DBName:             "sub2api",
+		SSLMode:            "disable",
+		TargetSessionAttrs: "read-write",
+	}
+
+	got := d.ReaderDSNWithTimezone("UTC")
+	if !strings.Contains(got, "host=writer.internal") {
+		t.Fatalf("ReaderDSNWithTimezone should fall back to writer host: %q", got)
+	}
+	if !strings.Contains(got, "target_session_attrs=read-write") {
+		t.Fatalf("ReaderDSNWithTimezone should fall back to writer target_session_attrs: %q", got)
+	}
+}
+
 func TestValidateAbsoluteHTTPURLMissingHost(t *testing.T) {
 	if err := ValidateAbsoluteHTTPURL("https://"); err == nil {
 		t.Fatalf("ValidateAbsoluteHTTPURL should reject missing host")

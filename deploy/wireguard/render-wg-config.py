@@ -16,8 +16,8 @@ listen_port = inventory["listen_port"]
 print("[Interface]")
 print(f"Address = {node['wg_ip']}/24")
 print(f"ListenPort = {listen_port}")
+print("MTU = 1280")
 print(f"PrivateKey = {keys[node_name]['private_key']}")
-print("SaveConfig = true")
 
 for peer_name, peer in inventory["nodes"].items():
     if peer_name == node_name:

@@ -35,14 +35,20 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	if err != nil {
 		return nil, err
 	}
-	client, err := repository.ProvideEnt(configConfig)
+	entBundle, err := repository.ProvideEntBundle(configConfig)
 	if err != nil {
 		return nil, err
 	}
-	db, err := repository.ProvideSQLDB(client)
+	client, err := repository.ProvideEnt(entBundle)
 	if err != nil {
 		return nil, err
 	}
+	db, err := repository.ProvideSQLDB(entBundle)
+	if err != nil {
+		return nil, err
+	}
+	readerEnt := repository.ProvideReaderEnt(entBundle)
+	readerDB := repository.ProvideReaderSQLDB(entBundle)
 	userRepository := repository.NewUserRepository(client, db)
 	redeemCodeRepository := repository.NewRedeemCodeRepository(client)
 	redisClient := repository.ProvideRedis(configConfig)
@@ -81,7 +87,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	authHandler := handler.NewAuthHandler(configConfig, authService, userService, settingService, promoService, redeemService, totpService)
 	userHandler := handler.NewUserHandler(userService)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeyService)
-	usageLogRepository := repository.NewUsageLogRepository(client, db)
+	usageLogRepository := repository.NewUsageLogRepository(client, db, readerEnt, readerDB)
 	usageBillingRepository := repository.NewUsageBillingRepository(client, db)
 	usageService := service.NewUsageService(usageLogRepository, userRepository, client, apiKeyAuthCacheInvalidator)
 	usageHandler := handler.NewUsageHandler(usageService, apiKeyService)

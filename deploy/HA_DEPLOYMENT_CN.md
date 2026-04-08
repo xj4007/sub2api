@@ -100,6 +100,7 @@
 
 - `deploy/HA_DEPLOYMENT_CN.md`：总手册。主要负责讲清楚整体架构、部署拓扑、HA、WireGuard、数据导入、故障切换这些背景信息。
 - `deploy/RELEASE_RUNBOOK_CN.md`：发布手册。只要你准备上线、做 canary、全量发布、回滚，就看这个文档。
+- `deploy/READ_WRITE_SPLIT_PILOT_CN.md`：读写分离试点方案。只要你准备推进 PostgreSQL 读写分离、reader proxy、试点菜单下沉到从库，就看这个文档。
 
 所以请记住这条最重要的规则：
 
@@ -113,10 +114,19 @@
 - 全量发布
 - 回滚
 
+这里说的“读写分离试点相关”，包括：
+
+- writer / reader 双连接设计
+- reader proxy 的部署方式
+- 哪些接口第一批走从库
+- 哪些接口明确不能走从库
+- 读写分离试点的验证与回滚
+
 你可以把它简单理解成：
 
 - `HA_DEPLOYMENT_CN.md` 是“整体说明书”
 - `RELEASE_RUNBOOK_CN.md` 是“真正操作时要照着走的步骤手册”
+- `READ_WRITE_SPLIT_PILOT_CN.md` 是“读写分离试点专项方案”
 
 以后如果你只是想了解：
 
@@ -141,6 +151,16 @@
 那就直接看：
 
 - `deploy/RELEASE_RUNBOOK_CN.md`
+
+如果你准备开始做 PostgreSQL 读写分离试点：
+
+- 新增 reader proxy
+- 增加 writer / reader 双连接
+- 先把“仪表盘 + 使用记录”部分查询下沉到从库
+
+那就直接看：
+
+- `deploy/READ_WRITE_SPLIT_PILOT_CN.md`
 
 ---
 
@@ -1143,7 +1163,7 @@ sub2api -> 本机 pgproxy(HAProxy) -> 10.77.0.1/10.77.0.2/10.77.0.3
 - 管理员登录继续成功
 - 最后把 `db2` 拉回副本
 
-当前演练后的最终状态：
+故障切换演练刚结束时的状态：
 
 - `db1 / 10.77.0.1`：**primary**
 - `db2 / 10.77.0.2`：replica（streaming）
@@ -1154,6 +1174,119 @@ sub2api -> 本机 pgproxy(HAProxy) -> 10.77.0.1/10.77.0.2/10.77.0.3
 - WireGuard 改造后，HA 仍然正常
 - PostgreSQL 自动切主能力没有被破坏
 - 应用层在 WG 内网地址下继续可用
+
+### 16.9.1 当前最新运行状态补充（读写分离试点期间）
+
+后续在推进 PostgreSQL 读写分离试点时，又发现了一个新的运行状态变化，需要单独记录：
+
+- `db2` 后来不再是简单的 `catchup`
+- 它实际暴露出了复制异常
+- 一度进入 Patroni 管理下的 **reinit / creating replica** 流程
+- 主库也确实对 `db2` 执行了 `pg_basebackup`
+
+这说明：
+
+> `db2` 当时不是“未知挂死”，而是 Patroni 正在按受控方式重建这个副本。
+
+也就是说，当时对 `db2` 的正确理解不是：
+
+- “它只是慢一点，等等就好”
+
+而是：
+
+- “它处于 Patroni 管理下的可解释、可恢复的重建状态”
+
+在 `db2` 完全恢复成稳定 `streaming` 之前，当时的实践建议是：
+
+- **不要把 reader 流量依赖在 db2 上**
+- 优先使用健康副本 `db3`
+
+后续实际结果是：
+
+- 先定位到 WG 大包传输 / 复制链路异常
+- 把 6 台机器的 WireGuard `MTU` 收紧到 `1280`
+- 对 `db2` 做 cleaner rebuild
+- 最终 `db2` 已恢复成稳定 `streaming`
+
+所以当前最新状态已经不再是“重建中”，而是：
+
+- `db1`：Leader
+- `db2`：Replica（streaming）
+- `db3`：Replica（streaming）
+
+也就是说，现在 `db2` 已重新回到可用副本集合中。
+
+### 16.9.2 副本进入 catchup 后的处理规则
+
+这里需要特别明确一条运维口径：
+
+当前建议不是：
+
+- 一看到 `catchup` 就立刻重建
+
+也不是：
+
+- 无限等待它自己恢复
+
+而是：
+
+1. **先观察它是否还能自愈**
+   - 看 `pg_last_wal_receive_lsn()` / `pg_last_wal_replay_lsn()` 是否持续前进
+   - 看 walreceiver 是否稳定
+   - 看 lag 是否持续缩小
+
+2. **如果已经确认无法恢复，再执行重建**
+   - 例如长时间停在旧 LSN
+   - walreceiver 周期性 timeout 重连
+   - lag 不下降
+   - 已经不适合作为 reader / failover 候选
+
+3. **重建时使用 Patroni 管理下的 `reinit`**
+
+也就是说，当前应该把这条规则理解成：
+
+> **副本进入 catchup 后，先判断它是否还能自行恢复；如果已经确认无法恢复，再执行 reinit。**
+
+### 16.9.3 关于自动 failover 的安全判断
+
+需要特别注意：
+
+- `creating replica` 状态的副本，不应视为可用 failover 候选
+- `catchup` 状态本身，也不要被误认为“天然安全，不会被提升”
+
+最安全的运维口径是：
+
+> **只把稳定 `streaming` 的副本当作可信 failover 候选。**
+
+按当前最新状态理解：
+
+- `db2`：已恢复为健康 streaming 副本
+- `db3`：健康，可作为可靠副本
+
+而在 `db2` 出问题的那个阶段，正确的临时口径仍然是：
+
+- 不把 `db2` 当作可信 reader / failover 候选
+
+### 16.9.4 当时对 db2 重建卡住的判断
+
+目前已经查到的情况是：
+
+- `db2` 长时间停在 `creating replica`
+- Patroni 日志持续显示 `reinitialize in progress`
+- 数据目录几乎还是空的
+- 容器内 `pg_basebackup` 进程存在
+- 复制认证手工测试可以通过
+- 但主库上看不到稳定持续的 `pg_basebackup` / `replicator` 会话来自 `db2`
+
+这说明当前更像是：
+
+> `db2` 的 reinit 已经启动，但重建流程卡在 **basebackup 启动或建立稳定传输之前的阶段**。
+
+所以现在的判断不是“完全未知”，而是：
+
+- 不是简单 catchup
+- 也不是健康 streaming
+- 而是一个**处于 Patroni 管理下、但当前仍未完成的副本重建问题**
 
 ### 16.10 下次如果某台服务器公网 IP 改了，应该怎么处理
 

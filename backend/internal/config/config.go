@@ -655,13 +655,16 @@ func (s *ServerConfig) Address() string {
 // DatabaseConfig 数据库连接配置
 // 性能优化：新增连接池参数，避免频繁创建/销毁连接
 type DatabaseConfig struct {
-	Host               string `mapstructure:"host"`
-	Port               int    `mapstructure:"port"`
-	User               string `mapstructure:"user"`
-	Password           string `mapstructure:"password"`
-	DBName             string `mapstructure:"dbname"`
-	SSLMode            string `mapstructure:"sslmode"`
-	TargetSessionAttrs string `mapstructure:"target_session_attrs"`
+	Host                     string `mapstructure:"host"`
+	Port                     int    `mapstructure:"port"`
+	User                     string `mapstructure:"user"`
+	Password                 string `mapstructure:"password"`
+	DBName                   string `mapstructure:"dbname"`
+	SSLMode                  string `mapstructure:"sslmode"`
+	TargetSessionAttrs       string `mapstructure:"target_session_attrs"`
+	ReaderHost               string `mapstructure:"reader_host"`
+	ReaderPort               int    `mapstructure:"reader_port"`
+	ReaderTargetSessionAttrs string `mapstructure:"reader_target_session_attrs"`
 	// 连接池配置（性能优化：可配置化连接池参数）
 	// MaxOpenConns: 最大打开连接数，控制数据库连接上限，防止资源耗尽
 	MaxOpenConns int `mapstructure:"max_open_conns"`
@@ -674,26 +677,7 @@ type DatabaseConfig struct {
 }
 
 func (d *DatabaseConfig) DSN() string {
-	targetSessionAttrs := strings.TrimSpace(d.TargetSessionAttrs)
-	// 当密码为空时不包含 password 参数，避免 libpq 解析错误
-	if d.Password == "" {
-		dsn := fmt.Sprintf(
-			"host=%s port=%d user=%s dbname=%s sslmode=%s",
-			d.Host, d.Port, d.User, d.DBName, d.SSLMode,
-		)
-		if targetSessionAttrs != "" {
-			dsn += fmt.Sprintf(" target_session_attrs=%s", targetSessionAttrs)
-		}
-		return dsn
-	}
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode,
-	)
-	if targetSessionAttrs != "" {
-		dsn += fmt.Sprintf(" target_session_attrs=%s", targetSessionAttrs)
-	}
-	return dsn
+	return d.dsnFor(d.Host, d.Port, d.TargetSessionAttrs, "")
 }
 
 // DSNWithTimezone returns DSN with timezone setting
@@ -701,22 +685,39 @@ func (d *DatabaseConfig) DSNWithTimezone(tz string) string {
 	if tz == "" {
 		tz = "Asia/Shanghai"
 	}
-	targetSessionAttrs := strings.TrimSpace(d.TargetSessionAttrs)
-	// 当密码为空时不包含 password 参数，避免 libpq 解析错误
-	if d.Password == "" {
-		dsn := fmt.Sprintf(
-			"host=%s port=%d user=%s dbname=%s sslmode=%s TimeZone=%s",
-			d.Host, d.Port, d.User, d.DBName, d.SSLMode, tz,
-		)
-		if targetSessionAttrs != "" {
-			dsn += fmt.Sprintf(" target_session_attrs=%s", targetSessionAttrs)
-		}
-		return dsn
+	return d.dsnFor(d.Host, d.Port, d.TargetSessionAttrs, tz)
+}
+
+func (d *DatabaseConfig) ReaderDSN() string {
+	if strings.TrimSpace(d.ReaderHost) == "" {
+		return d.DSN()
 	}
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s TimeZone=%s",
-		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode, tz,
-	)
+	return d.dsnFor(d.ReaderHost, d.ReaderPort, d.ReaderTargetSessionAttrs, "")
+}
+
+func (d *DatabaseConfig) ReaderDSNWithTimezone(tz string) string {
+	if strings.TrimSpace(d.ReaderHost) == "" {
+		return d.DSNWithTimezone(tz)
+	}
+	if tz == "" {
+		tz = "Asia/Shanghai"
+	}
+	return d.dsnFor(d.ReaderHost, d.ReaderPort, d.ReaderTargetSessionAttrs, tz)
+}
+
+func (d *DatabaseConfig) dsnFor(host string, port int, targetSessionAttrs string, tz string) string {
+	targetSessionAttrs = strings.TrimSpace(targetSessionAttrs)
+	base := "host=%s port=%d user=%s dbname=%s sslmode=%s"
+	args := []any{host, port, d.User, d.DBName, d.SSLMode}
+	if d.Password != "" {
+		base = "host=%s port=%d user=%s password=%s dbname=%s sslmode=%s"
+		args = []any{host, port, d.User, d.Password, d.DBName, d.SSLMode}
+	}
+	if tz != "" {
+		base += " TimeZone=%s"
+		args = append(args, tz)
+	}
+	dsn := fmt.Sprintf(base, args...)
 	if targetSessionAttrs != "" {
 		dsn += fmt.Sprintf(" target_session_attrs=%s", targetSessionAttrs)
 	}
@@ -999,6 +1000,8 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	cfg.LinuxDo.UserInfoUsernamePath = strings.TrimSpace(cfg.LinuxDo.UserInfoUsernamePath)
 	cfg.Dashboard.KeyPrefix = strings.TrimSpace(cfg.Dashboard.KeyPrefix)
 	cfg.Database.TargetSessionAttrs = strings.ToLower(strings.TrimSpace(cfg.Database.TargetSessionAttrs))
+	cfg.Database.ReaderHost = strings.TrimSpace(cfg.Database.ReaderHost)
+	cfg.Database.ReaderTargetSessionAttrs = strings.ToLower(strings.TrimSpace(cfg.Database.ReaderTargetSessionAttrs))
 	cfg.Redis.SentinelMasterName = strings.TrimSpace(cfg.Redis.SentinelMasterName)
 	cfg.Redis.SentinelAddrs = strings.Join(cfg.Redis.SentinelAddresses(), ",")
 	cfg.CORS.AllowedOrigins = normalizeStringSlice(cfg.CORS.AllowedOrigins)
@@ -1178,6 +1181,9 @@ func setDefaults() {
 	viper.SetDefault("database.dbname", "sub2api")
 	viper.SetDefault("database.sslmode", "prefer")
 	viper.SetDefault("database.target_session_attrs", "")
+	viper.SetDefault("database.reader_host", "")
+	viper.SetDefault("database.reader_port", 5432)
+	viper.SetDefault("database.reader_target_session_attrs", "")
 	viper.SetDefault("database.max_open_conns", 256)
 	viper.SetDefault("database.max_idle_conns", 128)
 	viper.SetDefault("database.conn_max_lifetime_minutes", 30)
@@ -1633,6 +1639,18 @@ func (c *Config) Validate() error {
 		case "any", "read-write", "read-only", "primary", "standby", "prefer-standby":
 		default:
 			return fmt.Errorf("database.target_session_attrs must be one of: any/read-write/read-only/primary/standby/prefer-standby")
+		}
+	}
+	if readerHost := strings.TrimSpace(c.Database.ReaderHost); readerHost != "" {
+		if c.Database.ReaderPort <= 0 {
+			return fmt.Errorf("database.reader_port must be positive when database.reader_host is set")
+		}
+		if targetSessionAttrs := strings.TrimSpace(c.Database.ReaderTargetSessionAttrs); targetSessionAttrs != "" {
+			switch targetSessionAttrs {
+			case "any", "read-write", "read-only", "primary", "standby", "prefer-standby":
+			default:
+				return fmt.Errorf("database.reader_target_session_attrs must be one of: any/read-write/read-only/primary/standby/prefer-standby")
+			}
 		}
 	}
 	if c.Database.MaxIdleConns < 0 {
