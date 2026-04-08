@@ -10,11 +10,26 @@ import (
 )
 
 type settingRepository struct {
-	client *ent.Client
+	client       *ent.Client
+	readerClient *ent.Client
 }
 
-func NewSettingRepository(client *ent.Client) service.SettingRepository {
-	return &settingRepository{client: client}
+func NewSettingRepository(client *ent.Client, readerClient *ReaderEntClient) service.SettingRepository {
+	repo := &settingRepository{client: client}
+	if readerClient != nil {
+		repo.readerClient = readerClient.Client
+	}
+	return repo
+}
+
+func (r *settingRepository) readClient() *ent.Client {
+	if r != nil && r.readerClient != nil {
+		return r.readerClient
+	}
+	if r == nil {
+		return nil
+	}
+	return r.client
 }
 
 func (r *settingRepository) Get(ctx context.Context, key string) (*service.Setting, error) {
@@ -57,7 +72,7 @@ func (r *settingRepository) GetMultiple(ctx context.Context, keys []string) (map
 	if len(keys) == 0 {
 		return map[string]string{}, nil
 	}
-	settings, err := r.client.Setting.Query().Where(setting.KeyIn(keys...)).All(ctx)
+	settings, err := r.readClient().Setting.Query().Where(setting.KeyIn(keys...)).All(ctx)
 	if err != nil {
 		return nil, err
 	}

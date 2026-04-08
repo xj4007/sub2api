@@ -17,21 +17,38 @@ import (
 )
 
 type apiKeyRepository struct {
-	client *dbent.Client
-	sql    sqlExecutor
+	client       *dbent.Client
+	sql          sqlExecutor
+	readerClient *dbent.Client
 }
 
-func NewAPIKeyRepository(client *dbent.Client, sqlDB *sql.DB) service.APIKeyRepository {
-	return newAPIKeyRepositoryWithSQL(client, sqlDB)
+func NewAPIKeyRepository(client *dbent.Client, sqlDB *sql.DB, readerClient *ReaderEntClient) service.APIKeyRepository {
+	return newAPIKeyRepositoryWithSQL(client, sqlDB, readerClient)
 }
 
-func newAPIKeyRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *apiKeyRepository {
-	return &apiKeyRepository{client: client, sql: sqlq}
+func newAPIKeyRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor, readerClient *ReaderEntClient) *apiKeyRepository {
+	repo := &apiKeyRepository{client: client, sql: sqlq}
+	if readerClient != nil {
+		repo.readerClient = readerClient.Client
+	}
+	return repo
 }
 
 func (r *apiKeyRepository) activeQuery() *dbent.APIKeyQuery {
 	// 默认过滤已软删除记录，避免删除后仍被查询到。
 	return r.client.APIKey.Query().Where(apikey.DeletedAtIsNil())
+}
+
+func (r *apiKeyRepository) readClient(ctx context.Context) *dbent.Client {
+	defaultClient := r.client
+	if r != nil && r.readerClient != nil {
+		defaultClient = r.readerClient
+	}
+	return clientFromContext(ctx, defaultClient)
+}
+
+func (r *apiKeyRepository) readActiveQuery(ctx context.Context) *dbent.APIKeyQuery {
+	return r.readClient(ctx).APIKey.Query().Where(apikey.DeletedAtIsNil())
 }
 
 func (r *apiKeyRepository) Create(ctx context.Context, key *service.APIKey) error {
@@ -284,7 +301,7 @@ func (r *apiKeyRepository) Delete(ctx context.Context, id int64) error {
 }
 
 func (r *apiKeyRepository) ListByUserID(ctx context.Context, userID int64, params pagination.PaginationParams, filters service.APIKeyListFilters) ([]service.APIKey, *pagination.PaginationResult, error) {
-	q := r.activeQuery().Where(apikey.UserIDEQ(userID))
+	q := r.readActiveQuery(ctx).Where(apikey.UserIDEQ(userID))
 
 	// Apply filters
 	if filters.Search != "" {

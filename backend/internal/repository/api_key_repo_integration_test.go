@@ -26,7 +26,7 @@ func (s *APIKeyRepoSuite) SetupTest() {
 	s.ctx = context.Background()
 	tx := testEntTx(s.T())
 	s.client = tx.Client()
-	s.repo = newAPIKeyRepositoryWithSQL(s.client, tx)
+	s.repo = newAPIKeyRepositoryWithSQL(s.client, tx, nil)
 }
 
 func TestAPIKeyRepoSuite(t *testing.T) {
