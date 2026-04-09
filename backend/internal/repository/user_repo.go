@@ -20,16 +20,29 @@ import (
 )
 
 type userRepository struct {
-	client *dbent.Client
-	sql    sqlExecutor
+	client       *dbent.Client
+	sql          sqlExecutor
+	readerClient *dbent.Client
 }
 
-func NewUserRepository(client *dbent.Client, sqlDB *sql.DB) service.UserRepository {
-	return newUserRepositoryWithSQL(client, sqlDB)
+func NewUserRepository(client *dbent.Client, sqlDB *sql.DB, readerClient *ReaderEntClient) service.UserRepository {
+	return newUserRepositoryWithSQL(client, sqlDB, readerClient)
 }
 
-func newUserRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *userRepository {
-	return &userRepository{client: client, sql: sqlq}
+func newUserRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor, readerClient *ReaderEntClient) *userRepository {
+	repo := &userRepository{client: client, sql: sqlq}
+	if readerClient != nil {
+		repo.readerClient = readerClient.Client
+	}
+	return repo
+}
+
+func (r *userRepository) readClient(ctx context.Context) *dbent.Client {
+	defaultClient := r.client
+	if r != nil && r.readerClient != nil {
+		defaultClient = r.readerClient
+	}
+	return clientFromContext(ctx, defaultClient)
 }
 
 func (r *userRepository) Create(ctx context.Context, userIn *service.User) error {
@@ -82,7 +95,7 @@ func (r *userRepository) Create(ctx context.Context, userIn *service.User) error
 }
 
 func (r *userRepository) GetByID(ctx context.Context, id int64) (*service.User, error) {
-	m, err := r.client.User.Query().Where(dbuser.IDEQ(id)).Only(ctx)
+	m, err := r.readClient(ctx).User.Query().Where(dbuser.IDEQ(id)).Only(ctx)
 	if err != nil {
 		return nil, translatePersistenceError(err, service.ErrUserNotFound, nil)
 	}
@@ -436,7 +449,7 @@ func (r *userRepository) loadAllowedGroups(ctx context.Context, userIDs []int64)
 		return out, nil
 	}
 
-	rows, err := r.client.UserAllowedGroup.Query().
+	rows, err := r.readClient(ctx).UserAllowedGroup.Query().
 		Where(userallowedgroup.UserIDIn(userIDs...)).
 		All(ctx)
 	if err != nil {

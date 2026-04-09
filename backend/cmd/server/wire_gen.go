@@ -49,7 +49,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	}
 	readerEnt := repository.ProvideReaderEnt(entBundle)
 	readerDB := repository.ProvideReaderSQLDB(entBundle)
-	userRepository := repository.NewUserRepository(client, db)
+	userRepository := repository.NewUserRepository(client, db, readerEnt)
 	redeemCodeRepository := repository.NewRedeemCodeRepository(client, readerEnt)
 	redisClient := repository.ProvideRedis(configConfig)
 	refreshTokenCache := repository.NewRefreshTokenCache(redisClient)
@@ -64,7 +64,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	emailQueueService := service.ProvideEmailQueueService(emailService)
 	promoCodeRepository := repository.NewPromoCodeRepository(client)
 	billingCache := repository.NewBillingCache(redisClient)
-	userSubscriptionRepository := repository.NewUserSubscriptionRepository(client)
+	userSubscriptionRepository := repository.NewUserSubscriptionRepository(client, readerEnt)
 	apiKeyRepository := repository.NewAPIKeyRepository(client, db, readerEnt)
 	billingCacheService := service.NewBillingCacheService(billingCache, userRepository, userSubscriptionRepository, apiKeyRepository, configConfig)
 	userGroupRateRepository := repository.NewUserGroupRateRepository(db)
