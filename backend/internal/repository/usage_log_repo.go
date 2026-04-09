@@ -2723,9 +2723,9 @@ func (r *usageLogRepository) ListWithFilters(ctx context.Context, params paginat
 		err  error
 	)
 	if shouldUseFastUsageLogTotal(filters) {
-		logs, page, err = r.listUsageLogsWithFastPaginationOnSQL(ctx, r.sql, whereClause, args, params)
+		logs, page, err = r.listUsageLogsWithFastPagination(ctx, whereClause, args, params)
 	} else {
-		logs, page, err = r.listUsageLogsWithPaginationOnSQL(ctx, r.sql, whereClause, args, params)
+		logs, page, err = r.listUsageLogsWithPagination(ctx, whereClause, args, params)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -4014,7 +4014,7 @@ func (r *usageLogRepository) loadUsers(ctx context.Context, ids []int64) (map[in
 	if len(ids) == 0 {
 		return out, nil
 	}
-	models, err := r.client.User.Query().Where(dbuser.IDIn(ids...)).All(ctx)
+	models, err := r.readClient().User.Query().Where(dbuser.IDIn(ids...)).All(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -4029,7 +4029,7 @@ func (r *usageLogRepository) loadAPIKeys(ctx context.Context, ids []int64) (map[
 	if len(ids) == 0 {
 		return out, nil
 	}
-	models, err := r.client.APIKey.Query().Where(dbapikey.IDIn(ids...)).All(ctx)
+	models, err := r.readClient().APIKey.Query().Where(dbapikey.IDIn(ids...)).All(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -4044,7 +4044,7 @@ func (r *usageLogRepository) loadAccounts(ctx context.Context, ids []int64) (map
 	if len(ids) == 0 {
 		return out, nil
 	}
-	models, err := r.client.Account.Query().Where(dbaccount.IDIn(ids...)).All(ctx)
+	models, err := r.readClient().Account.Query().Where(dbaccount.IDIn(ids...)).All(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -4059,7 +4059,7 @@ func (r *usageLogRepository) loadGroups(ctx context.Context, ids []int64) (map[i
 	if len(ids) == 0 {
 		return out, nil
 	}
-	models, err := r.client.Group.Query().Where(dbgroup.IDIn(ids...)).All(ctx)
+	models, err := r.readClient().Group.Query().Where(dbgroup.IDIn(ids...)).All(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -4074,7 +4074,7 @@ func (r *usageLogRepository) loadSubscriptions(ctx context.Context, ids []int64)
 	if len(ids) == 0 {
 		return out, nil
 	}
-	models, err := r.client.UserSubscription.Query().Where(dbusersub.IDIn(ids...)).All(ctx)
+	models, err := r.readClient().UserSubscription.Query().Where(dbusersub.IDIn(ids...)).All(ctx)
 	if err != nil {
 		return nil, err
 	}
