@@ -49,7 +49,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	}
 	readerEnt := repository.ProvideReaderEnt(entBundle)
 	readerDB := repository.ProvideReaderSQLDB(entBundle)
-	userRepository := repository.NewUserRepository(client, db)
+	userRepository := repository.NewUserRepository(client, db, readerEnt)
 	redeemCodeRepository := repository.NewRedeemCodeRepository(client, readerEnt)
 	redisClient := repository.ProvideRedis(configConfig)
 	refreshTokenCache := repository.NewRefreshTokenCache(redisClient)

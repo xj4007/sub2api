@@ -32,7 +32,7 @@ func main() {
 		}
 	}()
 
-	userRepo := repository.NewUserRepository(client, sqlDB)
+	userRepo := repository.NewUserRepository(client, sqlDB, nil)
 	authService := service.NewAuthService(client, userRepo, nil, nil, cfg, nil, nil, nil, nil, nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

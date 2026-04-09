@@ -34,7 +34,7 @@ func TestUserRepository_RemoveGroupFromAllowedGroups_RemovesAllOccurrences(t *te
 		Save(ctx)
 	require.NoError(t, err)
 
-	repo := newUserRepositoryWithSQL(entClient, tx)
+	repo := newUserRepositoryWithSQL(entClient, tx, nil)
 
 	u1 := &service.User{
 		Email:         uniqueTestValue(t, "u1") + "@example.com",
@@ -96,7 +96,7 @@ func TestGroupRepository_DeleteCascade_RemovesAllowedGroupsAndClearsApiKeys(t *t
 		Save(ctx)
 	require.NoError(t, err)
 
-	userRepo := newUserRepositoryWithSQL(entClient, tx)
+	userRepo := newUserRepositoryWithSQL(entClient, tx, nil)
 	groupRepo := newGroupRepositoryWithSQL(entClient, tx)
 	apiKeyRepo := newAPIKeyRepositoryWithSQL(entClient, tx)
 
