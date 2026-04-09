@@ -816,6 +816,65 @@ reader 入口当前已经使用 Patroni 的 replica 健康检查。
 
 ---
 
+## 10.12.6 用户实际使用频率分层（按前端调用路径）
+
+这一节不是按“技术上能不能切 reader”来分，而是按**前端真实页面调用路径**来区分用户体感上的使用频率，便于后续判断哪些接口属于高价值路径。
+
+这里的口径是：
+
+- **高频**：主页面、仪表盘、登录态刷新、主导航页经常访问
+- **中频**：在某个功能页内经常访问，但不是全局主路径
+- **低频**：只在设置 / 安全 / 较少进入的页面使用
+
+### 高频接口
+
+| 接口 | 频率 | 前端证据 | 说明 |
+|---|---|---|---|
+| `GET /api/v1/settings/public` | **高频** | `frontend/vite.config.ts` 在开发模式下注入公开配置时直接拉取 `/api/v1/settings/public` | 这类接口属于应用启动级公共配置。 |
+| `GET /api/v1/auth/me` | **高频** | `frontend/src/stores/auth.ts` 的 `refreshUser()` 调用 `authAPI.getCurrentUser()` | 登录后刷新用户态、恢复会话时会频繁使用。 |
+| `GET /api/v1/usage` | **高频** | `frontend/src/views/user/DashboardView.vue` 的 `loadRecent()`、`frontend/src/views/KeyUsageView.vue`、`frontend/src/router/index.ts`、`AppSidebar.vue` 都直接关联 `/usage` | 既是独立主页面，也是仪表盘最近使用记录来源。 |
+| `GET /api/v1/keys` | **高频** | `frontend/src/views/user/KeysView.vue` 主页面调用 `keysAPI.list(...)`，且 `AppSidebar.vue` / `AppHeader.vue` / `useRoutePrefetch.ts` 都把 `/keys` 当主路径 | 这是用户最核心的操作页面之一。 |
+| `GET /api/v1/usage/dashboard/stats` | **高频** | `frontend/src/views/user/DashboardView.vue` 的 `onMounted()` → `refreshAll()` → `usageAPI.getDashboardStats()` | 仪表盘首屏即会拉取。 |
+| `GET /api/v1/usage/dashboard/trend` | **高频** | `DashboardView.vue` 的 `loadCharts()` 调 `usageAPI.getDashboardTrend()` | 仪表盘趋势图主数据源。 |
+| `GET /api/v1/usage/dashboard/models` | **高频** | `DashboardView.vue` 的 `loadCharts()` 调 `usageAPI.getDashboardModels()` | 仪表盘模型统计主数据源。 |
+| `POST /api/v1/usage/dashboard/api-keys-usage` | **高频** | `frontend/src/views/user/KeysView.vue` 会为当前列表中的 Key 批量拉取 usage stats | `/keys` 页面中会持续使用。 |
+
+### 中频接口
+
+| 接口 | 频率 | 前端证据 | 说明 |
+|---|---|---|---|
+| `GET /api/v1/subscriptions/active` | **中频** | `frontend/src/stores/subscriptions.ts` 有缓存和轮询，`AppHeader.vue` 的 `SubscriptionProgressMini` 依赖它 | 不是每次导航都主动点击，但属于常驻状态来源。 |
+| `GET /api/v1/groups/available` | **中频** | `frontend/src/api/groups.ts` + `frontend/src/views/user/KeysView.vue` 用于 Key 页面分组下拉 | 主要在 `/keys` 相关操作中使用。 |
+| `GET /api/v1/groups/rates` | **中频** | `KeysView.vue` 依赖 `userGroupRates` 组装分组展示与倍率信息 | 也是 `/keys` 页面的配套数据。 |
+| `GET /api/v1/redeem/history` | **中频** | `frontend/src/views/user/RedeemView.vue` 调用 `redeemAPI.getHistory()` | 用户进入兑换页时会使用，但不是全局高频页面。 |
+
+### 低频接口
+
+| 接口 | 频率 | 前端证据 | 说明 |
+|---|---|---|---|
+| `GET /api/v1/user/totp/status` | **低频** | `frontend/src/api/totp.ts` + `components/user/profile/*` 主要在 profile/TOTP 相关组件中使用 | 只有进入安全设置 / 2FA 相关操作时才会访问。 |
+
+### 一句话总结
+
+如果只从“用户经常会不会打到它”来看，当前高价值路径主要集中在：
+
+- `settings/public`
+- `auth/me`
+- `usage`
+- `keys`
+- `usage/dashboard/*`
+
+而这也是为什么前面的 reader rollout 优先覆盖：
+
+- 仪表盘统计
+- 使用记录
+- API Key 列表
+- 公共设置
+
+因为这些接口对整体用户流量面的影响最大。
+
+---
+
 ## 10.13 2026-04-09 下一批 reader 实施结果（profile / subscriptions）
 
 这一轮继续遵守相同原则：
