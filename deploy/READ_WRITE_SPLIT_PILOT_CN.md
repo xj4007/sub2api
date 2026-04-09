@@ -816,6 +816,42 @@ reader 入口当前已经使用 Patroni 的 replica 健康检查。
 
 ---
 
+## 10.13 2026-04-09 下一批 reader 实施结果（profile / subscriptions）
+
+这一轮继续遵守相同原则：
+
+- 允许 reader 侧有一定延迟
+- 但代码仍坚持 **低耦合、少冲突**
+- 优先只在 repository 层加 reader client / read helper
+- 不把主从判断扩散到 handler / service
+
+### 10.13.1 本轮已完成并进入 reader 的接口
+
+| 接口 | 当前状态 | 代码链路 | 说明 |
+|---|---|---|---|
+| `GET /api/v1/user/profile` | **reader** | `UserHandler.GetProfile` → `UserService.GetByID` → `userRepository.GetByID` | 通过 `userRepository` 的 reader client 收口到从库，`AllowedGroups` 读取也统一走 reader 视角。 |
+| `GET /api/v1/subscriptions` | **reader** | `SubscriptionHandler.List` → `SubscriptionService.ListUserSubscriptions` → `userSubscriptionRepository.ListByUserID` | 通过 `ListByUserID` 的 reader 路径接入从库。 |
+| `GET /api/v1/subscriptions/summary` | **reader** | `SubscriptionHandler.GetSummary` → `SubscriptionService.ListActiveUserSubscriptions` → `userSubscriptionRepository.ListActiveByUserID` | 通过 `ListActiveByUserID` 的 reader 路径接入从库。 |
+| `GET /api/v1/subscriptions/progress` | **reader** | `SubscriptionHandler.GetProgress` → `SubscriptionService.GetSubscriptionProgress` → `userSubscriptionRepository.GetByID` | `GetByID` 已切到 reader，且因为该方法已 preload `Group`，当前无需再把 reader 判断扩散到 service 层。 |
+
+### 10.13.2 本轮明确继续 defer 的接口
+
+| 接口 | 当前状态 | 原因 |
+|---|---|---|
+| `GET /api/v1/announcements` | **writer / evaluate-first** | `AnnouncementService.ListForUser` 当前会组合 `userRepo.GetByID`、`userSubscriptionRepo.ListActiveByUserID`、`announcementRepo.ListActive`、`announcementReadRepo.GetReadMapByUser` 的结果，再在 service 层计算 targeting / read state / visible list。若继续推进，极易把“reader 视角”逻辑提升到 service 层，违背本轮低耦合原则。 |
+
+### 10.13.3 这轮为什么只做了 4 条
+
+因为这 4 条都还能维持在：
+
+- repository-local reader 收口
+- unit test 先红后绿
+- 不需要 handler / service 主从分支
+
+而 `announcements` 当前并不是单 repository 读路径，更像一条“多 repo 聚合后的统一可见性视图”，所以这轮保守 defer 是更合理的取舍。
+
+---
+
 ## 11. 哪些方法明确禁止走 reader
 
 这部分要作为硬规则写死。
