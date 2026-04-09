@@ -82,7 +82,7 @@
 2. **将构建好的镜像导出成 tar.gz**
 3. **把镜像包复制到服务器**
 4. **在服务器上 `docker load` 导入**
-5. **再通过 `docker-compose up -d` 启动**
+5. **再通过 `docker compose up -d` 启动**
 
 也就是说，应用层发版不是服务器现场 `git pull && docker build`，而是：
 
@@ -365,8 +365,8 @@ scp /tmp/sub2api-ha-bundle/app-images.tar.gz root@<APP_IP>:/opt/sub2api-ha-app-i
 ```bash
 gunzip -c /opt/sub2api-ha-app-images.tar.gz | docker load
 cd /opt/sub2api-ha/app
-docker-compose down --remove-orphans || true
-docker-compose up -d
+docker compose down --remove-orphans || true
+docker compose up -d
 ```
 
 如果是第一次部署，建议先检查：
@@ -377,10 +377,15 @@ ls -la
 cat .env
 ```
 
-这里应用层机器当前装的是 `docker-compose`，不是 `docker compose` 插件，所以仍然使用：
+当前 4/5/6 号应用机都同时装了：
+
+- `docker compose`（v5.1.1）
+- `docker-compose`（v1.29.2）
+
+其中 `docker-compose` v1 在重建容器时会触发 `KeyError: 'ContainerConfig'`，所以应用层后续应统一使用：
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 ---
@@ -711,8 +716,8 @@ Layer7 wrong status, code: 503
 ```bash
 gunzip -c /tmp/app-images.tar.gz | docker load
 cd /opt/sub2api-ha/app
-docker-compose down --remove-orphans || true
-docker-compose up -d
+docker compose down --remove-orphans || true
+docker compose up -d
 ```
 
 8. 验证 `/health`

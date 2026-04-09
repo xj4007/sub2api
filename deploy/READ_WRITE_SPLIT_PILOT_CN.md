@@ -730,7 +730,7 @@ reader 入口当前已经使用 Patroni 的 replica 健康检查。
 |---|---|---|---|
 | `GET /api/v1/usage/dashboard/trend` | **reader** | `UsageHandler.DashboardTrend` → `UsageService.GetUserUsageTrendByUserID` → `usageLogRepository.GetUserUsageTrendByUserID` | `usage_log_repo.go` 里这条方法显式使用 `readSQL()`，当前已经走从库。 |
 | `GET /api/v1/usage/dashboard/models` | **reader** | `UsageHandler.DashboardModels` → `UsageService.GetUserModelStats` → `usageLogRepository.GetUserModelStats` | 这条模型统计查询显式使用 reader-backed 查询路径。 |
-| `GET /api/v1/usage` | **writer** | `UsageHandler.List` → `UsageService.ListWithFilters` → `usageLogRepository.ListWithFilters` | 明细分页列表当前仍走 `r.sql` / 默认主路径，真实环境里也已确认先固定保留在 writer。 |
+| `GET /api/v1/usage` | **mixed** | `UsageHandler.List` → `UsageService.ListWithFilters` → `usageLogRepository.ListWithFilters` | 主体列表查询与关联 hydration 现在已经走 reader；但如果携带 `api_key_id` 过滤，handler 前置的 API Key 归属校验仍走 writer 路径。 |
 | `GET /api/v1/usage/dashboard/stats` | **reader** | `UsageHandler.DashboardStats` → `UsageService.GetUserDashboardStats` → `usageLogRepository.GetUserDashboardStats` | 这条接口现在已经完整走 `readSQL()`，today stats 也已收口到 reader 主线。 |
 | `GET /api/v1/auth/me` | **writer** | `AuthHandler.GetCurrentUser` → `UserService.GetByID` → `userRepository.GetByID` | 当前 `userRepository` 这条路径没有显式 reader helper，仍按默认主路径处理。 |
 | `GET /api/v1/subscriptions/active` | **writer** | `SubscriptionHandler.GetActive` → `SubscriptionService.ListActiveUserSubscriptions` → `userSubscriptionRepository.ListActiveByUserID` | 当前订阅读取链路没有显式 reader 接入。 |
@@ -748,6 +748,7 @@ reader 入口当前已经使用 Patroni 的 replica 健康检查。
 
 - `GET /api/v1/usage/dashboard/trend`
 - `GET /api/v1/usage/dashboard/models`
+- `GET /api/v1/usage`（主体列表 / hydration 已走 reader，`api_key_id` 归属校验仍是 writer 前置检查）
 - `GET /api/v1/usage/dashboard/stats`
 - `GET /api/v1/settings/public`
 - `GET /api/v1/redeem/history`
@@ -786,7 +787,7 @@ reader 入口当前已经使用 Patroni 的 replica 健康检查。
 | **P0** | `GET /api/v1/settings/public` | reader | 保持现状 | 已完成 repository-local reader 接入，且不需要 handler/service 识别主从。 |
 | **P0** | `GET /api/v1/redeem/history` | reader | 保持现状 | 已完成 repository-local reader 接入，查询语义仍保持在 redeem repository 内部。 |
 | **P0** | `GET /api/v1/keys` | reader | 保持现状 | 已完成 repository-local reader 接入，列表路径通过 `ListByUserID` 走 reader。 |
-| **P3** | `GET /api/v1/usage` | writer | 继续留 writer | 真实 canary 已经验证过，完整明细分页查询在 replica 上会长时间卡住，当前明确不应再次优先尝试。 |
+| **P0** | `GET /api/v1/usage` | mixed | 继续观察 | 主体列表查询与 hydration 已切到 reader，但 `api_key_id` 归属校验仍是 writer 前置检查；当前更适合先观察线上表现，而不是继续扩大改动面。 |
 | **P3** | `GET /api/v1/auth/me` | writer | 继续留 writer | 属于当前用户身份与会话即时状态读取，用户刚登录或状态变化后体感强，不适合优先下沉。 |
 | **P3** | `GET /api/v1/subscriptions/active` | writer | 继续留 writer | 订阅状态属于权益即时判断路径，延迟容忍度低。 |
 | **P3** | `GET /api/v1/groups/available` | writer | 继续留 writer | 这条接口会组合用户、分组、订阅信息，多仓库组合读取，改动面更大。 |
@@ -797,9 +798,10 @@ reader 入口当前已经使用 Patroni 的 replica 健康检查。
 
 如果按“尽量少改代码 + 尽量少和别人冲突”的原则继续推进，推荐顺序是：
 
-1. 先观察当前已经完成的 7 条 reader 路径是否稳定：
+1. 先观察当前已经完成的 8 条 reader / mixed 路径是否稳定：
    - `GET /api/v1/usage/dashboard/trend`
    - `GET /api/v1/usage/dashboard/models`
+   - `GET /api/v1/usage`
    - `GET /api/v1/usage/dashboard/stats`
    - `POST /api/v1/usage/dashboard/api-keys-usage`
    - `GET /api/v1/settings/public`
@@ -1238,7 +1240,7 @@ sed -n '1,120p' haproxy.cfg
 
 ```bash
 cd /opt/sub2api-ha/app
-docker-compose up -d pgproxy
+docker compose up -d pgproxy
 docker ps
 docker logs --tail 100 sub2api-pgproxy
 ```
@@ -1363,7 +1365,7 @@ rsync -az deploy/ha/app/ root@156.225.20.29:/opt/sub2api-ha/app/
 ```bash
 ssh root@45.192.105.162
 cd /opt/sub2api-ha/app
-docker-compose up -d pgproxy
+docker compose up -d pgproxy
 docker logs --tail 100 sub2api-pgproxy
 curl http://127.0.0.1:8080/health
 ```
@@ -1371,7 +1373,7 @@ curl http://127.0.0.1:8080/health
 ```bash
 ssh root@156.225.20.29
 cd /opt/sub2api-ha/app
-docker-compose up -d pgproxy
+docker compose up -d pgproxy
 docker logs --tail 100 sub2api-pgproxy
 curl http://127.0.0.1:8080/health
 ```
@@ -1410,7 +1412,7 @@ rsync -az deploy/ha/app/ root@156.225.20.29:/opt/sub2api-ha/app/
 
 ```bash
 cd /opt/sub2api-ha/app
-docker-compose up -d pgproxy
+docker compose up -d pgproxy
 docker logs --tail 100 sub2api-pgproxy
 curl http://127.0.0.1:8080/health
 ```
