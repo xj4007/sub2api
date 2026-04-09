@@ -998,6 +998,14 @@ apt-get install -y wireguard wireguard-tools
 - `AllowedIPs` 为对端的 `/32`
 - `Endpoint` 仍然使用对端公网 IP + `51820`
 - 真正的数据流量走 WG IP
+- 当前 6 台机器的 `wg0` 配置统一把 `MTU` 固定为 `1280`
+- `deploy/wireguard/render-wg-config.py` 已去掉 `SaveConfig = true`，避免运行中的配置被 `wg-quick` 回写覆盖，后续应继续以仓库渲染结果为准
+
+也就是说，当前这套 WireGuard 配置的生成口径是：
+
+- **6 台机器的 `wg0` 都使用 `MTU = 1280`**
+- **配置文件不再写 `SaveConfig = true`**
+- **如需调整 peer / endpoint / MTU，应修改仓库里的 inventory / 渲染脚本后重新生成并下发，而不是直接依赖机器上运行时回写**
 
 #### 第四步：启动 `wg-quick@wg0`
 

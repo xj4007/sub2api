@@ -264,25 +264,94 @@ writer 入口继续沿用当前逻辑：
 
 ### 7.3 reader 入口
 
-reader 入口新增一组 backend，候选节点还是：
+reader 入口当前已经使用 Patroni 的 replica 健康检查。
 
-- `10.77.0.1`
-- `10.77.0.2`
-- `10.77.0.3`
+当前真实做法是：
 
-但检查方式改成：
-
-- `/replica`
-
-如果可以，建议再加 lag 门槛，变成类似：
-
-- `/replica?lag=<阈值>`
+- 通过 `/replica?lag=16777216` 判断副本是否可读
+- 只有 Patroni 返回 `200` 的节点，才允许进入 reader backend
 
 这样可以避免：
 
 - 虽然还是 replica
 - 但复制延迟已经很高
 - 仍然被拿来承担读流量
+
+### 7.3.1 当前已经上线的 reader proxy 形态
+
+当前生产上已经真实存在的是：
+
+- writer 入口：`5432`
+- reader 入口：`5433`
+- reader 通过 Patroni `/replica?lag=16777216` 选择副本
+
+在第一轮试点落地时，reader backend 采用的是比较保守的方式：
+
+- `db2` 作为优先 reader
+- `db3` 作为 backup reader
+- `db1` 作为最后兜底 backup
+
+这种方式的优点是：
+
+- 行为简单
+- 排障直观
+- 在试点初期更容易控制风险
+
+### 7.3.2 已批准的下一步升级方案
+
+基于这轮讨论，目前已经确认下一步 reader proxy 的目标形态应改为：
+
+- **reader 池只包含 `db2` 与 `db3`**
+- **`db1` 不再进入 reader backend**
+- **`db2` 与 `db3` 都作为 active reader，承担读流量**
+
+也就是说，目标形态不是：
+
+- 一个主用副本 + 一个 backup 副本 + 主库兜底
+
+而是：
+
+> **`db2 + db3` 双副本均衡读，`db1` 不进 reader 池。**
+
+这样设计的原因是：
+
+1. 把读流量真正分散到两个副本，而不是长期压在一个副本上
+2. 副本异常时，reader 池会自动摘掉坏副本
+3. 不把副本故障时的读流量偷偷回灌到主库
+4. 主库职责保持清晰：主库只负责写
+
+### 7.3.3 reader 池的剔除与恢复规则
+
+下一步 reader backend 继续沿用当前已经验证过的健康检查节奏：
+
+- `inter 2s`
+- `fall 2`
+- `rise 1`
+- `on-marked-down shutdown-sessions`
+
+预期行为是：
+
+- 任一副本连续两次检查失败，就从 reader 池摘除
+- 任一副本恢复一次成功，就重新加入 reader 池
+- 被标记 down 的副本，其现有会话也会被关闭，避免连接长期粘在坏副本上
+
+### 7.3.4 为什么 `db1` 不再做 reader 兜底
+
+这里要特别明确：
+
+- **下一步 reader 池故意不再让 `db1` 作为 fallback**
+
+原因不是主库不能读，而是我们不希望：
+
+- 副本一旦出问题
+- 读流量就自动回灌到主库
+- 让主库在故障时同时承担写压力与额外读压力
+
+这次试点里更合理的取舍是：
+
+> **两个副本都不合格时，reader 明确失败，也不要默认退回主库。**
+
+这会让副本问题暴露得更清楚，也更利于运维判断。
 
 ### 7.5 关于 `DATABASE_READER_TARGET_SESSION_ATTRS`
 
@@ -636,6 +705,115 @@ reader 入口新增一组 backend，候选节点还是：
 
 ---
 
+### 10.12 用户当前高频接口清单：哪些已经走从库，哪些还没有
+
+这一节专门回答当前这批用户侧高频接口的真实状态。
+
+判断口径统一按下面这条来理解：
+
+- **reader**：代码里已经明确落到 reader-backed repository helper
+- **mixed**：同一条接口内部，部分查询走 reader，部分查询仍走 writer
+- **writer**：当前代码路径里没有显式 reader helper，仍按默认主库 / 非 reader 路径处理
+
+这里要特别注意一个事实：
+
+> **当前代码里，只有 `backend/internal/repository/usage_log_repo.go` 明确实现了 reader-backed helper（`readSQL()` / `readDB()` / `readClient()`）。**
+
+所以你会看到：
+
+- usage / dashboard 这一支已经有部分接口真正走从库
+- 其他像 `auth`、`subscriptions`、`keys`、`groups`、`settings`、`redeem`、`totp` 这些路径，当前都还没有显式接入 reader 白名单
+
+#### 10.12.1 逐条接口状态
+
+| 接口 | 当前状态 | 代码链路 | 说明 |
+|---|---|---|---|
+| `GET /api/v1/usage/dashboard/trend` | **reader** | `UsageHandler.DashboardTrend` → `UsageService.GetUserUsageTrendByUserID` → `usageLogRepository.GetUserUsageTrendByUserID` | `usage_log_repo.go` 里这条方法显式使用 `readSQL()`，当前已经走从库。 |
+| `GET /api/v1/usage/dashboard/models` | **reader** | `UsageHandler.DashboardModels` → `UsageService.GetUserModelStats` → `usageLogRepository.GetUserModelStats` | 这条模型统计查询显式使用 reader-backed 查询路径。 |
+| `GET /api/v1/usage` | **writer** | `UsageHandler.List` → `UsageService.ListWithFilters` → `usageLogRepository.ListWithFilters` | 明细分页列表当前仍走 `r.sql` / 默认主路径，真实环境里也已确认先固定保留在 writer。 |
+| `GET /api/v1/usage/dashboard/stats` | **reader** | `UsageHandler.DashboardStats` → `UsageService.GetUserDashboardStats` → `usageLogRepository.GetUserDashboardStats` | 这条接口现在已经完整走 `readSQL()`，today stats 也已收口到 reader 主线。 |
+| `GET /api/v1/auth/me` | **writer** | `AuthHandler.GetCurrentUser` → `UserService.GetByID` → `userRepository.GetByID` | 当前 `userRepository` 这条路径没有显式 reader helper，仍按默认主路径处理。 |
+| `GET /api/v1/subscriptions/active` | **writer** | `SubscriptionHandler.GetActive` → `SubscriptionService.ListActiveUserSubscriptions` → `userSubscriptionRepository.ListActiveByUserID` | 当前订阅读取链路没有显式 reader 接入。 |
+| `GET /api/v1/keys` | **reader** | `APIKeyHandler.List` → `APIKeyService.List` → `apiKeyRepository.ListByUserID` | API Key 列表当前已经通过 `ListByUserID` 的 reader 主线接入从库。 |
+| `GET /api/v1/groups/available` | **writer** | `APIKeyHandler.GetAvailableGroups` → `APIKeyService.GetAvailableGroups` → `userRepository.GetByID` / `groupRepository.ListActive` / `userSubscriptionRepository.ListActiveByUserID` | 这条链路会组合用户、分组、订阅信息，当前都还没有接入显式 reader 路径。 |
+| `GET /api/v1/groups/rates` | **writer** | `APIKeyHandler.GetUserGroupRates` → `APIKeyService.GetUserGroupRates` → `userGroupRateRepository.GetByUserID` | 当前仍走默认主路径。 |
+| `GET /api/v1/settings/public` | **reader** | `SettingHandler.GetPublicSettings` → `SettingService.GetPublicSettings` → `settingRepository.GetMultiple` | 这条公共设置读取当前已经通过 `settingRepository.GetMultiple` 的 reader 路径接入从库。 |
+| `POST /api/v1/usage/dashboard/api-keys-usage` | **reader** | `UsageHandler.DashboardAPIKeysUsage` → `UsageService.GetBatchAPIKeyUsageStats` → `usageLogRepository.GetBatchAPIKeyUsageStats` | 这条批量统计查询显式使用 `readSQL()`，当前已经走从库。 |
+| `GET /api/v1/redeem/history` | **reader** | `RedeemHandler.GetHistory` → `RedeemService.GetUserHistory` → `redeemCodeRepository.ListByUser` | 这条历史记录查询当前已经通过 `ListByUser` 的 reader 路径接入从库。 |
+| `GET /api/v1/user/totp/status` | **writer** | `TotpHandler.GetStatus` → `TotpService.GetStatus` → `userRepository.GetByID` | 当前 TOTP 状态读取仍落在默认主路径。 |
+
+#### 10.12.2 当前一句话结论
+
+如果只看你这批接口，当前已经真正切到从库的只有：
+
+- `GET /api/v1/usage/dashboard/trend`
+- `GET /api/v1/usage/dashboard/models`
+- `GET /api/v1/usage/dashboard/stats`
+- `GET /api/v1/settings/public`
+- `GET /api/v1/redeem/history`
+- `GET /api/v1/keys`
+- `POST /api/v1/usage/dashboard/api-keys-usage`
+
+其余你列出来但未进入上面清单的接口，当前都还没有显式改成从库读取，应该继续按 **writer / 非 reader 白名单路径** 来理解。
+
+#### 10.12.3 为什么会是这个结果
+
+原因很简单：
+
+- 这轮真正实现读写分离的重点，集中在 `usage_log_repo.go`
+- 那里聚合了大部分 usage / dashboard 的历史统计、趋势、聚合查询
+- 其他 repository 目前还没有做同样的 reader helper 改造
+
+所以当前系统的真实状态不是“所有读接口都已经自动走从库”，而是：
+
+> **只有被明确纳入 reader 白名单的 usage / dashboard 查询，才会真正走从库；其余接口仍按默认主路径执行。**
+
+#### 10.12.4 下一批可考虑下沉到 reader 的优先级表
+
+为了避免后续扩展时重新讨论一轮，这里把你列出来的 13 个接口按下一批 reader 下沉优先级整理成 4 档：
+
+- **P0**：已经完成，不需要再讨论是否接入 reader
+- **P1**：下一批最值得做，收益直接、风险相对低
+- **P2**：可以评估，但不建议优先推进
+- **P3**：当前继续固定留在 writer，更稳
+
+| 优先级 | 接口 | 当前状态 | 建议 | 原因 |
+|---|---|---|---|---|
+| **P0** | `GET /api/v1/usage/dashboard/trend` | reader | 保持现状 | 已在 `usage_log_repo.go` 的 reader 主线上，历史趋势查询天然适合从库。 |
+| **P0** | `GET /api/v1/usage/dashboard/models` | reader | 保持现状 | 已显式使用 reader helper，属于典型聚合统计查询。 |
+| **P0** | `POST /api/v1/usage/dashboard/api-keys-usage` | reader | 保持现状 | 已显式走 reader，且属于批量聚合统计。 |
+| **P0** | `GET /api/v1/usage/dashboard/stats` | reader | 保持现状 | 这条接口已经完成收口，today stats 也已切到 reader 主线。 |
+| **P0** | `GET /api/v1/settings/public` | reader | 保持现状 | 已完成 repository-local reader 接入，且不需要 handler/service 识别主从。 |
+| **P0** | `GET /api/v1/redeem/history` | reader | 保持现状 | 已完成 repository-local reader 接入，查询语义仍保持在 redeem repository 内部。 |
+| **P0** | `GET /api/v1/keys` | reader | 保持现状 | 已完成 repository-local reader 接入，列表路径通过 `ListByUserID` 走 reader。 |
+| **P3** | `GET /api/v1/usage` | writer | 继续留 writer | 真实 canary 已经验证过，完整明细分页查询在 replica 上会长时间卡住，当前明确不应再次优先尝试。 |
+| **P3** | `GET /api/v1/auth/me` | writer | 继续留 writer | 属于当前用户身份与会话即时状态读取，用户刚登录或状态变化后体感强，不适合优先下沉。 |
+| **P3** | `GET /api/v1/subscriptions/active` | writer | 继续留 writer | 订阅状态属于权益即时判断路径，延迟容忍度低。 |
+| **P3** | `GET /api/v1/groups/available` | writer | 继续留 writer | 这条接口会组合用户、分组、订阅信息，多仓库组合读取，改动面更大。 |
+| **P3** | `GET /api/v1/groups/rates` | writer | 继续留 writer | 直接影响当前用户分组费率视图，和即时策略展示耦合较高。 |
+| **P3** | `GET /api/v1/user/totp/status` | writer | 继续留 writer | 这是 2FA / 安全状态查询，用户刚开关 TOTP 后往往会立刻刷新，不适合优先下沉。 |
+
+#### 10.12.5 推荐的下一步顺序
+
+如果按“尽量少改代码 + 尽量少和别人冲突”的原则继续推进，推荐顺序是：
+
+1. 先观察当前已经完成的 7 条 reader 路径是否稳定：
+   - `GET /api/v1/usage/dashboard/trend`
+   - `GET /api/v1/usage/dashboard/models`
+   - `GET /api/v1/usage/dashboard/stats`
+   - `POST /api/v1/usage/dashboard/api-keys-usage`
+   - `GET /api/v1/settings/public`
+   - `GET /api/v1/redeem/history`
+   - `GET /api/v1/keys`
+2. 再视观察结果，决定是否继续推进更高一致性要求的接口
+3. 其余即时状态 / 权益 / 安全相关接口继续保留在 writer
+
+也就是说，下一批最合理的推进方式不是“把剩下所有 GET 都一口气下沉到从库”，而是：
+
+> **先稳定观察当前已经完成的 usage/dashboard reader 白名单，再逐步评估新的 repository 路径。**
+
+---
+
 ## 11. 哪些方法明确禁止走 reader
 
 这部分要作为硬规则写死。
@@ -797,11 +975,17 @@ reader 入口新增一组 backend，候选节点还是：
 
 当前状态：
 
-- 只有一个 `frontend postgres_frontend`
-- 只有一个 `backend postgres_backend`
-- 只用 `/leader` 选当前主库
+- 已经同时存在 writer / reader 两个入口
+- writer 继续通过 `/leader` 选当前主库
+- reader 已经通过 `/replica?lag=16777216` 选副本
 
-这次要补的块：
+如果继续推进第二阶段拓扑升级，这个文件的关注点不再是“从 0 增加 reader”，而是：
+
+- 把已存在的 reader backend 从“保守优先级切换”调整为“双副本均衡读”
+- 把 `db1` 从 reader backend 中移除
+- 显式固定 reader backend 的均衡策略与剔除语义
+
+这次要调整的重点块：
 
 #### A. writer 保持现状
 
@@ -810,7 +994,7 @@ reader 入口新增一组 backend，候选节点还是：
 
 #### B. 新增 reader frontend
 
-建议新增一个 reader 入口端口，例如：
+这一块在第一轮试点中已经完成，当前 reader 入口端口是：
 
 - `5433`
 
@@ -820,19 +1004,20 @@ reader 入口新增一组 backend，候选节点还是：
 
 #### C. 新增 reader backend
 
-reader backend 的候选节点仍然是：
+第一轮试点落地时，reader backend 候选节点曾包含：
 
 - `10.77.0.1`
 - `10.77.0.2`
 - `10.77.0.3`
 
-但检查逻辑改成：
+但当前已批准的下一步目标应更新为：
 
-- `/replica`
+- reader backend 只保留 `db2` 与 `db3`
+- `db1` 不再进入 reader backend
 
-如果 Patroni 支持并且实现方便，进一步建议：
+reader backend 的检查逻辑继续保持：
 
-- `/replica?lag=<阈值>`
+- `/replica?lag=16777216`
 
 这样做的目的：
 
@@ -841,16 +1026,405 @@ reader backend 的候选节点仍然是：
 
 #### D. reader backend 的选择策略
 
-第一版建议不要做复杂负载均衡，先用：
+第一轮试点上线时，reader backend 采用过更保守的方式：
 
 - 一个优先副本
 - 一个备用副本
 
-理由：
+但基于这轮真实验证和后续讨论，当前已经批准的下一步策略应更新为：
 
-- 行为更稳定
-- 排障更简单
-- 更适合你当前这套小规模自建部署
+- `db2` 与 `db3` 同时进入 reader backend
+- 显式使用连接级均衡策略（建议 `roundrobin`）
+- `db1` 不进入 reader backend
+
+这样做的原因是：
+
+- 当前允许 reader 侧存在 1~5 秒延迟
+- 更重要的目标是把读压力分散到两个副本
+- 同时继续保留 Patroni lag-aware 健康检查来自动剔除坏副本
+
+需要特别注意：
+
+> **这里的均衡是连接级均衡，不是每条 SQL 的轮询。**
+
+也就是说，最终流量分布还会受应用连接池行为影响，但它仍然会比“长期只压一个副本”更合理。
+
+#### E. 可直接实施的 HAProxy 变更草案
+
+如果进入第二阶段实施，`deploy/ha/app/haproxy.cfg` 的 reader backend 建议直接按下面的目标形态调整。
+
+当前真实配置（简化后）是：
+
+```haproxy
+backend postgres_reader_backend
+    option httpchk GET /replica?lag=16777216
+    http-check expect status 200
+    default-server inter 2s fall 2 rise 1 on-marked-down shutdown-sessions
+    server db2 10.77.0.2:5432 check port 8008
+    server db3 10.77.0.3:5432 check port 8008 backup
+    server db1 10.77.0.1:5432 check port 8008 backup
+```
+
+目标配置（草案）应改成：
+
+```haproxy
+backend postgres_reader_backend
+    balance roundrobin
+    option httpchk GET /replica?lag=16777216
+    http-check expect status 200
+    default-server inter 2s fall 2 rise 1 on-marked-down shutdown-sessions
+    server db2 10.77.0.2:5432 check port 8008
+    server db3 10.77.0.3:5432 check port 8008
+```
+
+这份草案里有 3 个关键变化：
+
+1. **显式加入 `balance roundrobin`**
+   - 不依赖默认策略
+   - 让文档、配置和排障口径完全一致
+
+2. **去掉 `db3` 的 `backup` 语义**
+   - 让 `db2` 与 `db3` 都作为 active reader
+   - 平时共同承担读连接
+
+3. **把 `db1` 从 reader backend 完全移除**
+   - 不再作为 reader fallback
+   - 两个副本都不合格时，reader 明确失败
+
+#### F. 这次修改只动哪里
+
+第二阶段拓扑升级应尽量只动这一处：
+
+- `deploy/ha/app/haproxy.cfg`
+
+也就是说，这一轮不应该同时去改：
+
+- writer backend
+- `render-app-env.py`
+- reader DSN 结构
+- repository 白名单逻辑
+
+原因是这次目标非常明确：
+
+> **先验证“reader backend 从优先级切换升级为双副本均衡读”本身稳定，再考虑扩大 reader 接口范围。**
+
+#### G. 建议实施顺序
+
+如果进入实操，建议按这个顺序推进：
+
+1. **先修改 `deploy/ha/app/haproxy.cfg`**
+   - 只改 reader backend
+   - 不改 writer backend
+
+2. **先在单个 app 节点 canary**
+   - 只更新一台应用机的 `pgproxy`
+   - 观察 reader 连接是否同时落到 `db2` / `db3`
+
+3. **验证 canary 节点的 reader 行为**
+   - 访问当前已经走 reader 的接口
+   - 确认没有异常 5xx / timeout / reset 激增
+   - 确认 reader backend 没有频繁 flap
+
+4. **确认稳定后再全量到 3 台 app 节点**
+
+#### H. canary 阶段重点验证什么
+
+第二阶段 canary 不需要重新验证全站，只需要盯住和 reader backend 直接相关的现象：
+
+1. `db2` 与 `db3` 是否都收到来自 canary 节点的读连接
+2. reader 接口是否仍返回 `200`
+3. `db2` 或 `db3` 人为摘除后，reader 是否还能继续工作
+4. 恢复副本后，是否能重新加入 reader 池
+
+建议优先验证这些已经在 reader 路径上的接口：
+
+- `GET /api/v1/usage/dashboard/trend`
+- `GET /api/v1/usage/dashboard/models`
+- `GET /api/v1/usage/dashboard/stats`
+- `GET /api/v1/usage/dashboard/api-keys-usage`
+
+#### I. 明确的回滚触发条件
+
+如果出现下面任一情况，这一轮应直接回滚到“优先副本 + backup”的旧 reader 形态：
+
+- `db2` / `db3` 频繁在 up/down 间抖动
+- reader 接口明显出现新的超时或错误峰值
+- 两个副本中的任一个在承压后 lag 明显放大且持续不恢复
+- canary 期间观察到主库异常承担了本不该有的 reader 流量
+
+回滚方式应保持简单：
+
+- 恢复旧版 `postgres_reader_backend`
+- 重新加载 app 节点上的 `pgproxy`
+- 不需要改业务代码
+- 不需要改数据库结构
+
+#### J. 为什么这版草案已经可以直接实施
+
+因为它具备下面这些特征：
+
+- 目标配置已经明确到具体 backend 行
+- 变更范围只收敛在 `haproxy.cfg`
+- canary 与全量顺序已经明确
+- 成功信号与失败信号都已经列出
+- 回滚方式不依赖代码回退
+
+所以后续真正进入实施时，不需要再重新讨论“reader 池到底放谁、主库要不要兜底、均衡策略用什么”。
+
+#### K. 逐步执行命令级 runbook（canary / 验证 / 回滚）
+
+这一节把第二阶段拓扑升级直接展开成可执行步骤。
+
+默认前提：
+
+- 本轮只改 `deploy/ha/app/haproxy.cfg`
+- 不涉及数据库 migration
+- 按 `deploy/RELEASE_RUNBOOK_CN.md` 的“无 DB 改动：单节点 canary → 全量”执行
+- 默认 canary 节点仍使用 `154.12.21.52`
+
+##### K.1 本地准备
+
+1. 先确认本地 `deploy/ha/app/haproxy.cfg` 已改成目标 reader backend
+
+目标应类似：
+
+```haproxy
+backend postgres_reader_backend
+    balance roundrobin
+    option httpchk GET /replica?lag=16777216
+    http-check expect status 200
+    default-server inter 2s fall 2 rise 1 on-marked-down shutdown-sessions
+    server db2 10.77.0.2:5432 check port 8008
+    server db3 10.77.0.3:5432 check port 8008
+```
+
+2. 可在本地先做一次配置自检
+
+```bash
+docker run --rm -v "$PWD/deploy/ha/app/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro" haproxy:3.0-alpine haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+```
+
+预期：
+
+- 输出 `Configuration file is valid`
+
+##### K.2 下发到 canary 节点
+
+先只同步到 canary 节点 `154.12.21.52`：
+
+```bash
+rsync -az deploy/ha/app/ root@154.12.21.52:/opt/sub2api-ha/app/
+```
+
+登录 canary 节点：
+
+```bash
+ssh root@154.12.21.52
+```
+
+在服务器上检查目标文件是否到位：
+
+```bash
+cd /opt/sub2api-ha/app
+ls -la
+sed -n '1,120p' haproxy.cfg
+```
+
+##### K.3 只重建 pgproxy，不动应用镜像
+
+由于这轮只改 HAProxy 配置，不需要重新发布 `sub2api` 镜像。
+
+在 canary 节点执行：
+
+```bash
+cd /opt/sub2api-ha/app
+docker-compose up -d pgproxy
+docker ps
+docker logs --tail 100 sub2api-pgproxy
+```
+
+这里重点确认：
+
+- `sub2api-pgproxy` 已正常重建或重启
+- 没有明显的 HAProxy 配置报错
+
+##### K.4 验证 canary 节点本机 reader 端口
+
+在 canary 节点执行：
+
+```bash
+curl http://127.0.0.1:8080/health
+docker logs --tail 100 sub2api-pgproxy
+```
+
+如果需要进一步确认后端状态变化，可临时连续观察：
+
+```bash
+docker logs -f sub2api-pgproxy
+```
+
+##### K.5 验证两个副本都具备 reader 资格
+
+分别在 `db2` / `db3` 上执行：
+
+```bash
+curl http://127.0.0.1:8008/replica?lag=16777216
+docker exec sub2api-patroni psql -U sub2api -d postgres -c "select pg_is_in_recovery();"
+```
+
+预期：
+
+- `/replica?lag=16777216` 返回 `200`
+- `pg_is_in_recovery()` 返回 `t`
+
+##### K.6 验证 canary 节点 reader 接口
+
+在 canary 节点执行，优先验证已经走 reader 的接口：
+
+```bash
+curl "http://127.0.0.1:8080/api/v1/usage/dashboard/trend?start_date=2026-04-02&end_date=2026-04-08&granularity=day&timezone=Asia%2FShanghai"
+curl "http://127.0.0.1:8080/api/v1/usage/dashboard/models?start_date=2026-04-02&end_date=2026-04-08&timezone=Asia%2FShanghai"
+curl "http://127.0.0.1:8080/api/v1/usage/dashboard/stats?timezone=Asia%2FShanghai"
+curl -X POST "http://127.0.0.1:8080/api/v1/usage/dashboard/api-keys-usage" -H "Content-Type: application/json" -d '{}'
+```
+
+预期：
+
+- 接口返回 `200`
+- 没有明显新增 timeout / 5xx
+
+如果这些接口需要登录态，优先沿用你现有 canary 验证方式，在节点上先登录拿 token，再带 token 调用。
+
+##### K.7 验证读连接是否能分散到 `db2` / `db3`
+
+在 `db2` 与 `db3` 上分别执行：
+
+```bash
+docker exec sub2api-patroni psql -U sub2api -d postgres -c "select client_addr, state, usename, application_name from pg_stat_activity where client_addr = '10.77.0.4';"
+```
+
+说明：
+
+- `10.77.0.4` 是 canary 应用节点 `154.12.21.52` 的 WG IP
+- 如果后续换别的 app 节点做 canary，这里把 IP 换成对应 WG IP
+
+预期：
+
+- `db2` 与 `db3` 都能观察到来自 canary 节点的连接
+- 不要求绝对 50/50，但不能长期只落到一个副本
+
+##### K.8 人工摘除一个副本，验证自动切换
+
+建议先摘除 `db2` 做验证。
+
+在 `db2` 上执行：
+
+```bash
+curl -XPATCH http://127.0.0.1:8008/config -d '{"tags":{"noloadbalance":true}}'
+curl http://127.0.0.1:8008/replica?lag=16777216
+```
+
+预期：
+
+- 设置成功后，`db2` 不再通过 reader eligibility 检查
+
+然后回到 canary 节点，再次访问 reader 接口：
+
+```bash
+curl "http://127.0.0.1:8080/api/v1/usage/dashboard/trend?start_date=2026-04-02&end_date=2026-04-08&granularity=day&timezone=Asia%2FShanghai"
+```
+
+再到 `db3` 上看连接是否继续承接：
+
+```bash
+docker exec sub2api-patroni psql -U sub2api -d postgres -c "select client_addr, state, usename, application_name from pg_stat_activity where client_addr = '10.77.0.4';"
+```
+
+验证完后，把 `db2` 恢复：
+
+```bash
+curl -XPATCH http://127.0.0.1:8008/config -d '{"tags":{"noloadbalance":false}}'
+curl http://127.0.0.1:8008/replica?lag=16777216
+```
+
+恢复后再观察它是否重新加入 reader 池。
+
+##### K.9 canary 通过后的全量步骤
+
+如果 canary 节点观察稳定，再同步到另外两台应用节点：
+
+```bash
+rsync -az deploy/ha/app/ root@45.192.105.162:/opt/sub2api-ha/app/
+rsync -az deploy/ha/app/ root@156.225.20.29:/opt/sub2api-ha/app/
+```
+
+分别在两台机器执行：
+
+```bash
+ssh root@45.192.105.162
+cd /opt/sub2api-ha/app
+docker-compose up -d pgproxy
+docker logs --tail 100 sub2api-pgproxy
+curl http://127.0.0.1:8080/health
+```
+
+```bash
+ssh root@156.225.20.29
+cd /opt/sub2api-ha/app
+docker-compose up -d pgproxy
+docker logs --tail 100 sub2api-pgproxy
+curl http://127.0.0.1:8080/health
+```
+
+##### K.10 回滚步骤（命令级）
+
+如果 canary 或全量后触发回滚条件，直接恢复旧版 reader backend：
+
+旧版目标：
+
+```haproxy
+backend postgres_reader_backend
+    option httpchk GET /replica?lag=16777216
+    http-check expect status 200
+    default-server inter 2s fall 2 rise 1 on-marked-down shutdown-sessions
+    server db2 10.77.0.2:5432 check port 8008
+    server db3 10.77.0.3:5432 check port 8008 backup
+    server db1 10.77.0.1:5432 check port 8008 backup
+```
+
+本地恢复后，重新同步到目标 app 节点：
+
+```bash
+rsync -az deploy/ha/app/ root@154.12.21.52:/opt/sub2api-ha/app/
+```
+
+如已全量，则三台都同步：
+
+```bash
+rsync -az deploy/ha/app/ root@154.12.21.52:/opt/sub2api-ha/app/
+rsync -az deploy/ha/app/ root@45.192.105.162:/opt/sub2api-ha/app/
+rsync -az deploy/ha/app/ root@156.225.20.29:/opt/sub2api-ha/app/
+```
+
+每台回滚节点执行：
+
+```bash
+cd /opt/sub2api-ha/app
+docker-compose up -d pgproxy
+docker logs --tail 100 sub2api-pgproxy
+curl http://127.0.0.1:8080/health
+```
+
+##### K.11 回滚后最少验证项
+
+回滚后至少确认：
+
+1. `sub2api-pgproxy` 正常启动
+2. `/health` 正常
+3. reader 接口恢复正常
+4. `db2` 再次成为优先 reader，`db3` 只作为 backup
+
+如果只回滚了 canary 节点，那么验证完成后，该节点即可继续留在旧 reader 拓扑，等待下一轮再试。
 
 ### 14.3 `backend/internal/config/config.go`
 
@@ -1254,13 +1828,19 @@ reader backend 的候选节点仍然是：
    - 在真实环境里验证时，完整明细查询在副本上会长时间卡住
    - 所以当前先保守地把它留在 writer
 
-2. **db2 目前不是健康可用的 reader 副本**
-   - 它在试点期间暴露了复制异常
-   - 当前处于 Patroni 管理下的 `reinit / creating replica` 重建状态
-   - 在它恢复成稳定 `streaming` 之前，不应把 reader 依赖在它身上
+2. **reader proxy 的第二阶段拓扑升级还未实施**
+   - 当前 reader 路径虽然已经上线，但还保留着第一轮试点时的保守形态
+   - 下一步已批准的目标形态是：`db2 + db3` 双副本均衡读，`db1` 不进 reader 池
+   - 这一步属于 reader proxy 拓扑优化，不是重新设计代码架构
+
+补充说明：
+
+- `db2` 之前确实暴露过复制异常
+- 但经过后续排障与重建后，当前已经恢复成稳定 `streaming`
+- 所以现在 `db2` 与 `db3` 都可以作为后续 balanced reader 方案的候选副本
 
 ### 20.6 当前一句话状态
 
 如果只记一句话，可以记这个：
 
-> **读写分离试点已经成功上线，但当前是“统计 / 趋势先读副本，明细列表继续走主库，db2 仍在重建中”的保守稳定状态。**
+> **读写分离试点已经成功上线，当前是“统计 / 趋势先读副本、明细列表继续走主库”的保守稳定状态；下一步已批准把 reader proxy 升级为 `db2 + db3` 双副本均衡读，且 `db1` 不进入 reader 池。**

@@ -2459,7 +2459,7 @@ func (r *usageLogRepository) GetUserDashboardStats(ctx context.Context, userID i
 	`
 	if err := scanSingleRow(
 		ctx,
-		r.sql,
+		readSQL,
 		todayStatsQuery,
 		[]any{userID, today},
 		&stats.TodayRequests,

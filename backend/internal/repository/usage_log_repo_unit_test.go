@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
@@ -90,4 +91,73 @@ func TestUsageLogRepositoryReadSQLFallsBackToWriter(t *testing.T) {
 
 	require.Same(t, writer, repo.readSQL())
 	require.Same(t, writer, repo.readDB())
+}
+
+func TestGetUserDashboardStatsUsesReaderForAllQueries(t *testing.T) {
+	writerDB, writerMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer writerDB.Close()
+
+	readerDB, readerMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	defer readerDB.Close()
+
+	repo := &usageLogRepository{
+		sql:       writerDB,
+		db:        writerDB,
+		readerSQL: readerDB,
+		readerDB:  readerDB,
+	}
+
+	readerMock.ExpectQuery(`SELECT COUNT\(\*\) FROM api_keys WHERE user_id = \$1 AND deleted_at IS NULL`).
+		WithArgs(int64(42)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(3)))
+
+	readerMock.ExpectQuery(`SELECT COUNT\(\*\) FROM api_keys WHERE user_id = \$1 AND status = \$2 AND deleted_at IS NULL`).
+		WithArgs(int64(42), service.StatusActive).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(2)))
+
+	readerMock.ExpectQuery(`FROM usage_logs\s+WHERE user_id = \$1`).
+		WithArgs(int64(42)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"total_requests",
+			"total_input_tokens",
+			"total_output_tokens",
+			"total_cache_creation_tokens",
+			"total_cache_read_tokens",
+			"total_cost",
+			"total_actual_cost",
+			"avg_duration_ms",
+		}).AddRow(int64(10), int64(100), int64(200), int64(10), int64(5), float64(12.5), float64(10.5), float64(123.4)))
+
+	readerMock.ExpectQuery(`FROM usage_logs\s+WHERE user_id = \$1 AND created_at >= \$2`).
+		WithArgs(int64(42), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"today_requests",
+			"today_input_tokens",
+			"today_output_tokens",
+			"today_cache_creation_tokens",
+			"today_cache_read_tokens",
+			"today_cost",
+			"today_actual_cost",
+		}).AddRow(int64(4), int64(40), int64(80), int64(4), int64(2), float64(5.5), float64(4.5)))
+
+	readerMock.ExpectQuery(`FROM usage_logs\s+WHERE created_at >= \$1 AND user_id = \$2`).
+		WithArgs(sqlmock.AnyArg(), int64(42)).
+		WillReturnRows(sqlmock.NewRows([]string{"request_count", "token_count"}).AddRow(int64(15), int64(300)))
+
+	stats, err := repo.GetUserDashboardStats(t.Context(), 42)
+	require.NoError(t, err)
+	require.NotNil(t, stats)
+	require.Equal(t, int64(3), stats.TotalAPIKeys)
+	require.Equal(t, int64(2), stats.ActiveAPIKeys)
+	require.Equal(t, int64(10), stats.TotalRequests)
+	require.Equal(t, int64(315), stats.TotalTokens)
+	require.Equal(t, int64(4), stats.TodayRequests)
+	require.Equal(t, int64(126), stats.TodayTokens)
+	require.Equal(t, int64(3), stats.Rpm)
+	require.Equal(t, int64(60), stats.Tpm)
+
+	require.NoError(t, readerMock.ExpectationsWereMet())
+	require.NoError(t, writerMock.ExpectationsWereMet())
 }
