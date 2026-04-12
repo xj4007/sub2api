@@ -9,6 +9,114 @@
 - 数据层 / 应用层的启动顺序
 - 验证方法
 
+## 0. 重要告警：Redis / Sentinel 地址必须全量统一为 WG 地址
+
+这是一个必须放在最前面的告警，因为这套环境已经真实踩过一次坑，而且会直接导致业务请求报错。
+
+### 0.1 这次真实故障现象
+
+- 本地客户端正式请求返回：
+
+```text
+Concurrency limit exceeded for user, please retry later
+```
+
+- 但后台“账号管理”里的测试请求又是正常的
+- 应用日志持续出现：
+
+```text
+READONLY You can't write against a read only replica
+```
+
+### 0.2 根因总结
+
+根因不是 PostgreSQL 读写分离，而是 **Redis / Sentinel 同时混用了公网 IP 和 WireGuard IP**，导致 Sentinel 把同一台 Redis 节点识别成两个地址，进而反复发生伪故障切换。
+
+典型错误链路如下：
+
+1. Sentinel / Redis 内部同时出现 `156.225.x.x` 和 `10.77.x.x`
+2. Sentinel 把同一台机器当成两个实例
+3. `switch-master` 在公网地址和 WG 地址之间反复切换
+4. 应用偶发拿到只读副本，Redis 写命令失败
+5. 上层业务把底层 Redis 写失败包装成并发超限或 429
+
+### 0.3 必须死记住的规则
+
+**凡是 Redis / Sentinel / 应用访问 Redis 的地址，全部只允许使用 `10.77.0.0/24` 的 WG 地址。**
+
+禁止再混入公网 IP。公网 IP 在这套 HA 架构里只保留给：
+
+- SSH 登录
+- 对外访问入口
+- WireGuard peer endpoint
+
+### 0.4 必须统一为 WG 地址的地方
+
+#### 应用层
+
+- `REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379`
+
+#### 数据层 `.env`
+
+- `NODE_IP=10.77.0.x`
+- `REDIS_MASTER_HOST=10.77.0.x`
+- `REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379`
+
+#### Sentinel 运行态
+
+- `sentinel announce-ip` 必须是 `10.77.0.x`
+- `sentinel monitor sub2api-redis ...` 必须监控 `10.77.0.x`
+- `known-sentinel` / `known-replica` 不允许残留公网 IP
+
+#### Redis 运行态
+
+- replica 节点必须有：
+  - `replica-announce-ip=10.77.0.x`
+  - `replica-announce-port=6379`
+
+### 0.5 一个非常关键的隐藏坑
+
+`replica-announce-ip` 不是 Sentinel 在故障切换时自动补上的，它本质上是 Redis 进程启动参数。
+
+这意味着：
+
+- 如果某台机器最初按 `master` 启动
+- 后来被 Sentinel 在线降成 `replica`
+- 但你没有在下次重启时重新按当前拓扑启动它
+
+它就可能变成：
+
+- 角色已经是 replica
+- 但 `replica-announce-ip` 仍然为空
+
+一旦出现这种情况，Sentinel 很容易再次把该节点记成公网地址 / 错误地址。
+
+### 0.6 这次修复后的约束
+
+这次已经做了下面这些修复，后续不要回退：
+
+- `deploy/ha/db/redis-start.sh`
+  - 启动时优先向 Sentinel 查询**当前真实 master**
+  - 查询不到时才 fallback 到静态 `.env`
+  - 增加重试窗口，避免 Redis 启动瞬间 Sentinel 尚未就绪导致误判
+- `deploy/ha/db/sentinel-start.sh`
+  - 如果已有 `/data/sentinel.conf`，优先沿用已学习到的 Sentinel 状态
+  - 首次启动时从本机 Redis 的实际复制状态推断当前 master，而不是盲目信任旧的 `REDIS_MASTER_HOST`
+- 补回了：
+  - `deploy/ha/scripts/render-db-env.py`
+  - `deploy/ha/scripts/render-app-env.py`
+
+### 0.7 每次动 Redis / Sentinel 前必须做的检查
+
+至少先确认下面 4 件事：
+
+1. 应用层 `.env` 的 `REDIS_SENTINEL_ADDRS` 是否全是 `10.77.0.x:26379`
+2. 数据层 `.env` 的 `NODE_IP` / `REDIS_MASTER_HOST` / `REDIS_SENTINEL_ADDRS` 是否全是 WG 地址
+3. `SENTINEL get-master-addr-by-name sub2api-redis` 返回的是否是 `10.77.0.x`
+4. `sentinel.conf` 里是否还有 `154.x / 156.x / 45.x` 这类公网 IP 残留
+
+如果第 4 条不满足，不要带着这个状态继续运行。
+
 ---
 
 ## 1. 当前拓扑
@@ -205,7 +313,7 @@
 - `DATABASE_PORT=5432`
 - `REDIS_SENTINEL_ENABLED=true`
 - `REDIS_SENTINEL_MASTER_NAME=sub2api-redis`
-- `REDIS_SENTINEL_ADDRS=154.201.64.184:26379,154.12.80.55:26379,156.225.18.73:26379`
+- `REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379`
 
 ### 数据层关键变量
 
@@ -216,6 +324,7 @@
 - PostgreSQL 数据库名：`sub2api`
 - Redis master 名称：`sub2api-redis`
 - Redis 密码：`XIANjian4SANyun`
+- Redis / Sentinel 通信地址：**统一使用 `10.77.0.0/24`，禁止混入公网 IP**
 
 ### 当前应用管理员账号
 
@@ -440,6 +549,30 @@ Sentinel 主节点发现：
 docker exec sub2api-redis-sentinel redis-cli -p 26379 SENTINEL get-master-addr-by-name sub2api-redis
 ```
 
+必须确认返回的是 `10.77.0.x`，不是公网 IP。
+
+进一步检查 Sentinel 持久化配置：
+
+```bash
+docker exec sub2api-redis-sentinel cat /data/sentinel.conf | grep -E "monitor sub2api-redis|known-replica|known-sentinel|announce-ip"
+```
+
+这里也必须只看到 `10.77.0.x`。
+
+进一步检查 Redis 副本通告地址：
+
+```bash
+docker exec sub2api-redis redis-cli -a XIANjian4SANyun CONFIG GET replica-announce-ip
+docker exec sub2api-redis redis-cli -a XIANjian4SANyun INFO replication
+```
+
+如果当前节点是 replica，则必须确认：
+
+- `replica-announce-ip=10.77.0.x`
+- `master_host=10.77.0.x`
+
+如果发现 Sentinel 或 Redis 运行态里混入公网 IP，优先处理这个问题，不要继续排业务代码。
+
 ### 应用健康检查
 
 每台应用服务器执行：
@@ -486,6 +619,36 @@ lookup 154.201.64.184,154.12.80.55,156.225.18.73: no such host
 ```
 
 原因：应用启动阶段的 `AUTO_SETUP` 最开始不支持直接把多个 IP 塞进 `DATABASE_HOST`。
+
+### 1.5）Redis / Sentinel 绝对不能混用公网 IP 和 WG IP
+
+这是已经真实发生过线上故障的坑，必须单独强调：
+
+- 应用层 `REDIS_SENTINEL_ADDRS` 必须全是 `10.77.0.x:26379`
+- 数据层 `REDIS_MASTER_HOST` 必须是 WG 地址
+- Sentinel 的 `monitor` / `announce-ip` / `known-*` 必须只出现 WG 地址
+- Redis replica 必须带 `replica-announce-ip=10.77.0.x`
+
+否则会出现：
+
+- Sentinel 把同一节点识别成两个地址
+- `switch-master` 在公网 / WG 地址之间来回跳
+- 应用报 `READONLY You can't write against a read only replica`
+- 上层再把底层错误包装成并发超限 / 429
+
+### 1.6）不能只信静态 `.env` 里的 Redis 角色
+
+这次还踩到一个更隐蔽的问题：
+
+- 机器第一次部署时可能是 `REDIS_ROLE=master`
+- 之后真实运行中它已经被 Sentinel 切成 `replica`
+- 如果你后面重启容器时还只按旧 `.env` 启动，就可能把拓扑重新拉歪
+
+因此当前脚本的原则是：
+
+- Redis 启动时先问 Sentinel 当前 master 是谁
+- Sentinel 启动时先看本机 Redis 当前复制状态
+- 不能盲目信任旧的静态角色
 
 ### 2）应用层的 `.env` 不能被 rsync 覆盖删掉
 
