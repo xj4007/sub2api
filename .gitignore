@@ -118,6 +118,8 @@ tests
 CLAUDE.md
 .claude
 scripts
+!deploy/ha/scripts/
+!deploy/ha/scripts/*.py
 .code-review-state
 #openspec/
 code-reviews/
