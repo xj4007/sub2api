@@ -1,6 +1,6 @@
-# Sub2API 6 台服务器 HA 部署操作手册
+# Sub2API 8 台服务器 HA 部署操作手册
 
-本文记录当前这套 **3 台数据层 + 3 台应用层** 的实际部署方式，重点说明：
+本文记录当前这套 **5 台数据层 + 3 台应用层** 的实际部署方式，重点说明：
 
 - 当前拓扑
 - 下次如何重新部署
@@ -9,125 +9,19 @@
 - 数据层 / 应用层的启动顺序
 - 验证方法
 
-## 0. 重要告警：Redis / Sentinel 地址必须全量统一为 WG 地址
-
-这是一个必须放在最前面的告警，因为这套环境已经真实踩过一次坑，而且会直接导致业务请求报错。
-
-### 0.1 这次真实故障现象
-
-- 本地客户端正式请求返回：
-
-```text
-Concurrency limit exceeded for user, please retry later
-```
-
-- 但后台“账号管理”里的测试请求又是正常的
-- 应用日志持续出现：
-
-```text
-READONLY You can't write against a read only replica
-```
-
-### 0.2 根因总结
-
-根因不是 PostgreSQL 读写分离，而是 **Redis / Sentinel 同时混用了公网 IP 和 WireGuard IP**，导致 Sentinel 把同一台 Redis 节点识别成两个地址，进而反复发生伪故障切换。
-
-典型错误链路如下：
-
-1. Sentinel / Redis 内部同时出现 `156.225.x.x` 和 `10.77.x.x`
-2. Sentinel 把同一台机器当成两个实例
-3. `switch-master` 在公网地址和 WG 地址之间反复切换
-4. 应用偶发拿到只读副本，Redis 写命令失败
-5. 上层业务把底层 Redis 写失败包装成并发超限或 429
-
-### 0.3 必须死记住的规则
-
-**凡是 Redis / Sentinel / 应用访问 Redis 的地址，全部只允许使用 `10.77.0.0/24` 的 WG 地址。**
-
-禁止再混入公网 IP。公网 IP 在这套 HA 架构里只保留给：
-
-- SSH 登录
-- 对外访问入口
-- WireGuard peer endpoint
-
-### 0.4 必须统一为 WG 地址的地方
-
-#### 应用层
-
-- `REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379`
-
-#### 数据层 `.env`
-
-- `NODE_IP=10.77.0.x`
-- `REDIS_MASTER_HOST=10.77.0.x`
-- `REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379`
-
-#### Sentinel 运行态
-
-- `sentinel announce-ip` 必须是 `10.77.0.x`
-- `sentinel monitor sub2api-redis ...` 必须监控 `10.77.0.x`
-- `known-sentinel` / `known-replica` 不允许残留公网 IP
-
-#### Redis 运行态
-
-- replica 节点必须有：
-  - `replica-announce-ip=10.77.0.x`
-  - `replica-announce-port=6379`
-
-### 0.5 一个非常关键的隐藏坑
-
-`replica-announce-ip` 不是 Sentinel 在故障切换时自动补上的，它本质上是 Redis 进程启动参数。
-
-这意味着：
-
-- 如果某台机器最初按 `master` 启动
-- 后来被 Sentinel 在线降成 `replica`
-- 但你没有在下次重启时重新按当前拓扑启动它
-
-它就可能变成：
-
-- 角色已经是 replica
-- 但 `replica-announce-ip` 仍然为空
-
-一旦出现这种情况，Sentinel 很容易再次把该节点记成公网地址 / 错误地址。
-
-### 0.6 这次修复后的约束
-
-这次已经做了下面这些修复，后续不要回退：
-
-- `deploy/ha/db/redis-start.sh`
-  - 启动时优先向 Sentinel 查询**当前真实 master**
-  - 查询不到时才 fallback 到静态 `.env`
-  - 增加重试窗口，避免 Redis 启动瞬间 Sentinel 尚未就绪导致误判
-- `deploy/ha/db/sentinel-start.sh`
-  - 如果已有 `/data/sentinel.conf`，优先沿用已学习到的 Sentinel 状态
-  - 首次启动时从本机 Redis 的实际复制状态推断当前 master，而不是盲目信任旧的 `REDIS_MASTER_HOST`
-- 补回了：
-  - `deploy/ha/scripts/render-db-env.py`
-  - `deploy/ha/scripts/render-app-env.py`
-
-### 0.7 每次动 Redis / Sentinel 前必须做的检查
-
-至少先确认下面 4 件事：
-
-1. 应用层 `.env` 的 `REDIS_SENTINEL_ADDRS` 是否全是 `10.77.0.x:26379`
-2. 数据层 `.env` 的 `NODE_IP` / `REDIS_MASTER_HOST` / `REDIS_SENTINEL_ADDRS` 是否全是 WG 地址
-3. `SENTINEL get-master-addr-by-name sub2api-redis` 返回的是否是 `10.77.0.x`
-4. `sentinel.conf` 里是否还有 `154.x / 156.x / 45.x` 这类公网 IP 残留
-
-如果第 4 条不满足，不要带着这个状态继续运行。
-
 ---
 
 ## 1. 当前拓扑
 
-### 数据层（服务器 1~3）
+### 数据层（服务器 1~5）
 
 | 服务器 | IP | 角色 |
 |---|---|---|
-| 服务器1 | `154.201.64.184` | PostgreSQL replica / Redis master / Sentinel / etcd |
+| 服务器1 | `154.201.64.184` | PostgreSQL replica / Redis replica / Sentinel / etcd |
 | 服务器2 | `154.12.80.55` | PostgreSQL primary / Redis replica / Sentinel / etcd |
-| 服务器3 | `156.225.18.73` | PostgreSQL replica / Redis replica / Sentinel / etcd |
+| 服务器3 | `156.225.18.73` | PostgreSQL replica / Redis master / Sentinel / etcd |
+| 服务器4 | `211.101.237.129` | PostgreSQL replica / Redis replica / Sentinel / etcd |
+| 服务器5 | `101.237.129.94` | PostgreSQL replica / Redis replica / Sentinel / etcd |
 
 ### WireGuard 内网地址（当前已启用）
 
@@ -136,6 +30,8 @@ READONLY You can't write against a read only replica
 | `db1` | 服务器1 | `154.201.64.184` | `10.77.0.1` |
 | `db2` | 服务器2 | `154.12.80.55` | `10.77.0.2` |
 | `db3` | 服务器3 | `156.225.18.73` | `10.77.0.3` |
+| `db4` | 服务器7 | `211.101.237.129` | `10.77.0.7` |
+| `db5` | 服务器8 | `101.237.129.94` | `10.77.0.8` |
 | `app4` | 服务器4 | `154.12.21.52` | `10.77.0.4` |
 | `app5` | 服务器5 | `45.192.105.162` | `10.77.0.5` |
 | `app6` | 服务器6 | `156.225.20.29` | `10.77.0.6` |
@@ -152,7 +48,7 @@ READONLY You can't write against a read only replica
 
 > 注意：以下内容包含生产访问凭据，只应保存在你信任的私有仓库或私有环境中。
 
-所有 6 台服务器当前统一使用：
+所有 8 台服务器当前统一使用：
 
 - 端口：`22`
 - 用户：`root`
@@ -168,11 +64,13 @@ READONLY You can't write against a read only replica
 | 服务器4 | `154.12.21.52` | `22` | `root` | `XIANjian4SANyun` |
 | 服务器5 | `45.192.105.162` | `22` | `root` | `XIANjian4SANyun` |
 | 服务器6 | `156.225.20.29` | `22` | `root` | `XIANjian4SANyun` |
+| 服务器7 | `211.101.237.129` | `22` | `root` | `XIANjian4SANyun` |
+| 服务器8 | `101.237.129.94` | `22` | `root` | `XIANjian4SANyun` |
 
 ### 当前高可用设计
 
-- **PostgreSQL HA**：Patroni + etcd 三节点
-- **Redis HA**：1 主 2 从 + 3 Sentinel
+- **PostgreSQL HA**：Patroni + etcd 五节点
+- **Redis HA**：1 主 4 从 + 5 Sentinel
 - **服务器间内部通信**：统一走 WireGuard `10.77.0.0/24`
 - **应用访问 PostgreSQL**：不直接连多 host，而是先连每台应用机本地的 `pgproxy(HAProxy)`，再由 `pgproxy` 只转发到当前 Patroni 主库（后端已改用 WG IP）
 - **应用访问 Redis**：应用直接使用 Redis Sentinel 自动发现主节点（Sentinel seed 已改用 WG IP）
@@ -313,7 +211,7 @@ READONLY You can't write against a read only replica
 - `DATABASE_PORT=5432`
 - `REDIS_SENTINEL_ENABLED=true`
 - `REDIS_SENTINEL_MASTER_NAME=sub2api-redis`
-- `REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379`
+- `REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379,10.77.0.7:26379,10.77.0.8:26379`
 
 ### 数据层关键变量
 
@@ -324,7 +222,6 @@ READONLY You can't write against a read only replica
 - PostgreSQL 数据库名：`sub2api`
 - Redis master 名称：`sub2api-redis`
 - Redis 密码：`XIANjian4SANyun`
-- Redis / Sentinel 通信地址：**统一使用 `10.77.0.0/24`，禁止混入公网 IP**
 
 ### 当前应用管理员账号
 
@@ -399,12 +296,14 @@ docker save db-patroni:latest redis:8-alpine quay.io/coreos/etcd:v3.5.15 | gzip 
 
 ### 第四步：生成环境文件
 
-#### 生成 3 台数据层 `.env`
+#### 生成 5 台数据层 `.env`
 
 ```bash
 deploy/ha/scripts/render-db-env.py db1 154.201.64.184 master > /tmp/sub2api-ha-bundle/db1.env
 deploy/ha/scripts/render-db-env.py db2 154.12.80.55 replica > /tmp/sub2api-ha-bundle/db2.env
 deploy/ha/scripts/render-db-env.py db3 156.225.18.73 replica > /tmp/sub2api-ha-bundle/db3.env
+deploy/ha/scripts/render-db-env.py db4 211.101.237.129 replica > /tmp/sub2api-ha-bundle/db4.env
+deploy/ha/scripts/render-db-env.py db5 101.237.129.94 replica > /tmp/sub2api-ha-bundle/db5.env
 ```
 
 #### 生成应用层 `.env`
@@ -415,7 +314,7 @@ deploy/ha/scripts/render-app-env.py > /tmp/sub2api-ha-bundle/app.env
 
 ---
 
-## 6. 数据层重部署步骤（服务器 1~3）
+## 6. 数据层重部署步骤（服务器 1~5）
 
 ### 6.1 同步文件
 
@@ -549,30 +448,6 @@ Sentinel 主节点发现：
 docker exec sub2api-redis-sentinel redis-cli -p 26379 SENTINEL get-master-addr-by-name sub2api-redis
 ```
 
-必须确认返回的是 `10.77.0.x`，不是公网 IP。
-
-进一步检查 Sentinel 持久化配置：
-
-```bash
-docker exec sub2api-redis-sentinel cat /data/sentinel.conf | grep -E "monitor sub2api-redis|known-replica|known-sentinel|announce-ip"
-```
-
-这里也必须只看到 `10.77.0.x`。
-
-进一步检查 Redis 副本通告地址：
-
-```bash
-docker exec sub2api-redis redis-cli -a XIANjian4SANyun CONFIG GET replica-announce-ip
-docker exec sub2api-redis redis-cli -a XIANjian4SANyun INFO replication
-```
-
-如果当前节点是 replica，则必须确认：
-
-- `replica-announce-ip=10.77.0.x`
-- `master_host=10.77.0.x`
-
-如果发现 Sentinel 或 Redis 运行态里混入公网 IP，优先处理这个问题，不要继续排业务代码。
-
 ### 应用健康检查
 
 每台应用服务器执行：
@@ -619,36 +494,6 @@ lookup 154.201.64.184,154.12.80.55,156.225.18.73: no such host
 ```
 
 原因：应用启动阶段的 `AUTO_SETUP` 最开始不支持直接把多个 IP 塞进 `DATABASE_HOST`。
-
-### 1.5）Redis / Sentinel 绝对不能混用公网 IP 和 WG IP
-
-这是已经真实发生过线上故障的坑，必须单独强调：
-
-- 应用层 `REDIS_SENTINEL_ADDRS` 必须全是 `10.77.0.x:26379`
-- 数据层 `REDIS_MASTER_HOST` 必须是 WG 地址
-- Sentinel 的 `monitor` / `announce-ip` / `known-*` 必须只出现 WG 地址
-- Redis replica 必须带 `replica-announce-ip=10.77.0.x`
-
-否则会出现：
-
-- Sentinel 把同一节点识别成两个地址
-- `switch-master` 在公网 / WG 地址之间来回跳
-- 应用报 `READONLY You can't write against a read only replica`
-- 上层再把底层错误包装成并发超限 / 429
-
-### 1.6）不能只信静态 `.env` 里的 Redis 角色
-
-这次还踩到一个更隐蔽的问题：
-
-- 机器第一次部署时可能是 `REDIS_ROLE=master`
-- 之后真实运行中它已经被 Sentinel 切成 `replica`
-- 如果你后面重启容器时还只按旧 `.env` 启动，就可能把拓扑重新拉歪
-
-因此当前脚本的原则是：
-
-- Redis 启动时先问 Sentinel 当前 master 是谁
-- Sentinel 启动时先看本机 Redis 当前复制状态
-- 不能盲目信任旧的静态角色
 
 ### 2）应用层的 `.env` 不能被 rsync 覆盖删掉
 
@@ -816,7 +661,7 @@ Layer7 wrong status, code: 503
 3. 本地构建 `sub2api` 镜像
 4. 本地构建 Patroni 镜像
 5. 本地 `docker save` 打包镜像
-6. 先部署服务器 1~3 数据层
+6. 先部署当时的数据层节点
 7. 验证 Patroni leader/replica、Redis master/slave、Sentinel
 8. 再部署服务器 4~6 应用层
 9. 修复 AUTO_SETUP 对数据库/Redis HA 的兼容问题
@@ -828,8 +673,8 @@ Layer7 wrong status, code: 503
 
 ## 11. 当前最终状态
 
-- PostgreSQL：`db1` 主，`db2/db3` 从
-- Redis：`154.201.64.184` 主，另外两台从
+- PostgreSQL：`db2` 主，`db1/db3/db4/db5` 从（全部 `streaming`）
+- Redis：`db3 / 10.77.0.3` 主，`db1/db2/db4/db5` 从
 - 应用：`154.12.21.52` / `45.192.105.162` / `156.225.20.29` 均健康
 - 管理员登录验证通过：
   - `727965481@qq.com`
@@ -844,7 +689,7 @@ Layer7 wrong status, code: 503
 - 三台应用节点 `/health` 正常
 - 管理员登录接口返回 `200`
 - 4/5/6 号机升级到 Docker `29.3.1` + Compose `v5.1.1` 后，`sub2api` 未受影响
-- WireGuard 六节点组网正常，应用/数据库内部流量已切到 `10.77.0.x`
+- WireGuard 八节点组网正常，应用/数据库内部流量已切到 `10.77.0.x`
 
 ### 当前数据库保留状态
 
@@ -1088,7 +933,7 @@ ssh root@156.225.18.73 'docker exec sub2api-patroni psql -U sub2api -d postgres 
 
 ## 16. WireGuard 异地组网部署记录（已实际执行）
 
-本节记录当前 6 台服务器的 WireGuard 组网方式，以及 HA 栈如何切到 WG IP。
+本节记录当前 8 台服务器的 WireGuard 组网方式，以及 HA 栈如何切到 WG IP。
 
 ### 16.1 目标
 
@@ -1116,11 +961,11 @@ ssh root@156.225.18.73 'docker exec sub2api-patroni psql -U sub2api -d postgres 
 
 这些文件作用分别是：
 
-- `inventory.json`：定义 6 个节点的公网 IP 和 WG IP
+- `inventory.json`：定义 8 个节点的公网 IP 和 WG IP
 - `install-wireguard.sh`：在 Ubuntu 服务器安装 `wireguard` / `wireguard-tools`
 - `render-wg-config.py`：根据 inventory 和密钥生成每台机器的 `wg0.conf`
 
-### 16.3.1 当前 6 台机器正在使用的 WireGuard 密钥
+### 16.3.1 当前 8 台机器正在使用的 WireGuard 密钥
 
 > **极高敏感信息**：以下是当前生产环境正在使用的 WireGuard 私钥/公钥。任何拿到这些私钥的人都可以伪装成对应节点加入内网。只能保存在你自己可控的私有仓库或加密环境中，绝对不要外传。
 
@@ -1129,6 +974,8 @@ ssh root@156.225.18.73 'docker exec sub2api-patroni psql -U sub2api -d postgres 
 | `db1` | `10.77.0.1` | `OBGPbWl26xOsyOAM1ARdzqO9AGQIcfNp+7xyN1KtuXw=` | `vArJzfH3zg+Lm2wTpQz0dXfw/wvs6ZnLN0WBfZpjYV8=` |
 | `db2` | `10.77.0.2` | `+Hd+Erriox+zlgGGBNdeeiszi0STp1nKRRe5IgYNI1U=` | `aWIY9jmaetFvAsDWXj+v+rSTmJXL7zdvhEdSlmX5hVA=` |
 | `db3` | `10.77.0.3` | `SN/L0Hd/LyRVRSzQOTvPDkqR8mBz4JTh2RW4xejhIko=` | `4dFCKDRsh0JE4inn3CL670vQn3inyIzHjJKTXnr+Vk8=` |
+| `db4` | `10.77.0.7` | `cKU6wfop5Whr4vSu9WnfhWNZCQRS2/pJCOZ8Ydi83Xw=` | `YgkUtN6H/S/I6FNVCJwIM8bP66QCPPIpkF/5Ta2G53o=` |
+| `db5` | `10.77.0.8` | `eE/efnjN9uqflsDmCc3Ccnj866Gl7mSg5FORg68E9FY=` | `F16sH8bA+aUqKqCTHPTRchkB6K199XOWnR5BIl4tRwE=` |
 | `app4` | `10.77.0.4` | `WLBGforq2LbvoCc14BR1Q8bDh+YCK3WFDoNH6eRh6Xs=` | `yif/6wy/HU0yCzBCTJqbpsjzPNAhihYQuwjzsN4QoDo=` |
 | `app5` | `10.77.0.5` | `eE9497nVD/R4ipcImSqBrslJ97YycZ+gBN5TcjlDFUk=` | `5jh2S14mGc+1k+0ndsZOvKyqchfSvORn+ijCOllsGBc=` |
 | `app6` | `10.77.0.6` | `QPiq/oZuIxK0ZELhJ2KTBq8XscoIZg7ZbNT08XpI700=` | `po4sOJxRhwdbi9JxBw6TvbPLdawwuVZtudHbZnmwNhw=` |
@@ -1136,14 +983,14 @@ ssh root@156.225.18.73 'docker exec sub2api-patroni psql -U sub2api -d postgres 
 如果后续新增服务器，需要做的是：
 
 1. 给新服务器生成新的私钥/公钥
-2. 在现有 6 台机器的 `wg0.conf` 中新增一个 `[Peer]`
-3. 在新服务器的 `wg0.conf` 中把现有 6 台都写成 `[Peer]`
+2. 在现有机器的 `wg0.conf` 中为新节点新增一个 `[Peer]`
+3. 在新服务器的 `wg0.conf` 中把现有节点都写成 `[Peer]`
 4. 给新服务器分配一个新的 WG IP（例如 `10.77.0.7`）
 5. 重载所有相关节点的 WireGuard 配置
 
 ### 16.4 本次实际做了什么
 
-#### 第一步：在 6 台服务器安装 WireGuard
+#### 第一步：在 8 台服务器安装 WireGuard
 
 每台执行了：
 
@@ -1166,12 +1013,12 @@ apt-get install -y wireguard wireguard-tools
 - `AllowedIPs` 为对端的 `/32`
 - `Endpoint` 仍然使用对端公网 IP + `51820`
 - 真正的数据流量走 WG IP
-- 当前 6 台机器的 `wg0` 配置统一把 `MTU` 固定为 `1280`
+- 当前 8 台机器的 `wg0` 配置统一把 `MTU` 固定为 `1280`
 - `deploy/wireguard/render-wg-config.py` 已去掉 `SaveConfig = true`，避免运行中的配置被 `wg-quick` 回写覆盖，后续应继续以仓库渲染结果为准
 
 也就是说，当前这套 WireGuard 配置的生成口径是：
 
-- **6 台机器的 `wg0` 都使用 `MTU = 1280`**
+- **8 台机器的 `wg0` 都使用 `MTU = 1280`**
 - **配置文件不再写 `SaveConfig = true`**
 - **如需调整 peer / endpoint / MTU，应修改仓库里的 inventory / 渲染脚本后重新生成并下发，而不是直接依赖机器上运行时回写**
 
@@ -1185,7 +1032,7 @@ systemctl enable --now wg-quick@wg0
 
 #### 第五步：验证 WG 联通
 
-通过 `ping 10.77.0.x` 和 `wg show` 验证 6 节点组网成功。
+通过 `ping 10.77.0.x` 和 `wg show` 验证 8 节点组网成功。
 
 ### 16.5 HA 栈是怎么切到 WG IP 的
 
@@ -1195,7 +1042,7 @@ systemctl enable --now wg-quick@wg0
 
 - `NODE_IP=10.77.0.x`
 - `ETCD_INITIAL_CLUSTER=db1=http://10.77.0.1:2380,...`
-- `ETCD_HOSTS=10.77.0.1:2379,10.77.0.2:2379,10.77.0.3:2379`
+- `ETCD_HOSTS=10.77.0.1:2379,10.77.0.2:2379,10.77.0.3:2379,10.77.0.7:2379,10.77.0.8:2379`
 - `REDIS_MASTER_HOST=10.77.0.1`
 
 这意味着：
@@ -1210,15 +1057,17 @@ systemctl enable --now wg-quick@wg0
 `deploy/ha/app/haproxy.cfg` 已改成：
 
 ```text
-server db1 10.77.0.1:5432 check port 8008
-server db2 10.77.0.2:5432 check port 8008
-server db3 10.77.0.3:5432 check port 8008
+ server db1 10.77.0.1:5432 check port 8008
+ server db2 10.77.0.2:5432 check port 8008
+ server db3 10.77.0.3:5432 check port 8008
+ server db4 10.77.0.7:5432 check port 8008
+ server db5 10.77.0.8:5432 check port 8008
 ```
 
 `deploy/ha/scripts/render-app-env.py` 已改成：
 
 ```text
-REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379
+REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379,10.77.0.7:26379,10.77.0.8:26379
 ```
 
 所以现在：
@@ -1266,7 +1115,7 @@ docker compose up -d
 
 #### 1）WG 接口状态
 
-6 台机器都有：
+8 台机器都有：
 
 - `wg0`
 - 对端 handshake 正常
@@ -1283,8 +1132,10 @@ docker compose up -d
 
 当前主库看到副本地址：
 
-- `10.77.0.2`
+- `10.77.0.1`
 - `10.77.0.3`
+- `10.77.0.7`
+- `10.77.0.8`
 
 #### 4）三台应用节点健康
 
@@ -1303,15 +1154,17 @@ docker compose up -d
 三台应用节点部署后的 `/opt/sub2api-ha/app/haproxy.cfg` 都已确认：
 
 ```text
-server db1 10.77.0.1:5432 check port 8008
-server db2 10.77.0.2:5432 check port 8008
-server db3 10.77.0.3:5432 check port 8008
+ server db1 10.77.0.1:5432 check port 8008
+ server db2 10.77.0.2:5432 check port 8008
+ server db3 10.77.0.3:5432 check port 8008
+ server db4 10.77.0.7:5432 check port 8008
+ server db5 10.77.0.8:5432 check port 8008
 ```
 
 也就是说，现在 PostgreSQL 实际访问链路已经明确是：
 
 ```text
-sub2api -> 本机 pgproxy(HAProxy) -> 10.77.0.1/10.77.0.2/10.77.0.3
+sub2api -> 本机 pgproxy(HAProxy) -> 10.77.0.1/10.77.0.2/10.77.0.3/10.77.0.7/10.77.0.8
 ```
 
 #### 7）主库看到的 app 连接源地址也是 WG IP
@@ -1380,7 +1233,7 @@ sub2api -> 本机 pgproxy(HAProxy) -> 10.77.0.1/10.77.0.2/10.77.0.3
 后续实际结果是：
 
 - 先定位到 WG 大包传输 / 复制链路异常
-- 把 6 台机器的 WireGuard `MTU` 收紧到 `1280`
+- 把当时 6 台机器的 WireGuard `MTU` 收紧到 `1280`
 - 对 `db2` 做 cleaner rebuild
 - 最终 `db2` 已恢复成稳定 `streaming`
 
@@ -1464,6 +1317,44 @@ sub2api -> 本机 pgproxy(HAProxy) -> 10.77.0.1/10.77.0.2/10.77.0.3
 - 也不是健康 streaming
 - 而是一个**处于 Patroni 管理下、但当前仍未完成的副本重建问题**
 
+### 16.9.5 2026-04-16：数据层从 3 节点扩展到 5 节点
+
+本次新增两台数据节点：
+
+- `db4 / 211.101.237.129 / 10.77.0.7`
+- `db5 / 101.237.129.94 / 10.77.0.8`
+
+本次实际扩容顺序如下：
+
+1. 先给 `db4`、`db5` 安装 Docker + Compose v2 + WireGuard
+2. 先把 WireGuard 从 6 节点扩到 8 节点
+3. 验证老节点与新节点的 `10.77.0.x` 互通
+4. 在现有 etcd 集群中先 `member add db4`
+5. 启动 `db4` 的 etcd / Patroni / Redis / Sentinel
+6. 确认 `db4` 从 etcd 的 `unstarted` 变为 `started`
+7. 再执行 `member add db5`
+8. 启动 `db5` 的 etcd / Patroni / Redis / Sentinel
+9. 更新 3 台应用节点的 `haproxy.cfg` 与 `REDIS_SENTINEL_ADDRS`
+10. 验证 PostgreSQL / Redis / Sentinel / app `/health`
+
+本次扩容后的关键结果：
+
+- etcd：已扩为 **5 成员**
+- PostgreSQL：`db4` 与 `db5` 最终都进入稳定 `streaming`
+- Redis：已扩为 **1 主 4 从**
+- Sentinel：已扩为 **5 Sentinel**
+- app 侧 `pgproxy` 已把 writer / reader backend 扩到 `db1~db5`
+
+这次扩容里最重要的运维口径是：
+
+> **新增 etcd 成员时，一次只加一台；先让前一台从 `unstarted` 变成 `started`，再继续加下一台。**
+
+否则 etcd 会把集群视为 member 变更未完成，后续 `member add` 会返回：
+
+```text
+etcdserver: unhealthy cluster
+```
+
 ### 16.10 下次如果某台服务器公网 IP 改了，应该怎么处理
 
 如果公网 IP 变了，现在不需要再修改 PostgreSQL / etcd / Sentinel / HAProxy 里的内部地址，**只需要处理 WireGuard endpoint**。
@@ -1480,6 +1371,8 @@ sub2api -> 本机 pgproxy(HAProxy) -> 10.77.0.1/10.77.0.2/10.77.0.3
 - `10.77.0.4`
 - `10.77.0.5`
 - `10.77.0.6`
+- `10.77.0.7`
+- `10.77.0.8`
 
 这就是这次改造最大的收益。
 
@@ -1541,7 +1434,7 @@ http-check expect status 200
 down-after-milliseconds = 5000
 failover-timeout = 60000
 parallel-syncs = 1
-quorum = 2（3 个 Sentinel 场景下的实际判断逻辑）
+quorum = 2（5 个 Sentinel 场景下的实际配置，仍保持 2）
 ```
 
 ### 17.3 30 秒无返回、60 秒成功，这种情况 PostgreSQL 会不会自动切主？
