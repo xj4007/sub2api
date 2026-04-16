@@ -14,7 +14,7 @@ services:
       --listen-peer-urls http://0.0.0.0:2380
       --initial-advertise-peer-urls http://${NODE_IP}:2380
       --initial-cluster ${ETCD_INITIAL_CLUSTER}
-      --initial-cluster-state new
+      --initial-cluster-state ${ETCD_INITIAL_CLUSTER_STATE:-new}
       --initial-cluster-token sub2api-etcd
     volumes:
       - etcd_data:/etcd-data
@@ -57,8 +57,6 @@ services:
       REDIS_ROLE: ${REDIS_ROLE}
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       REDIS_MASTER_HOST: ${REDIS_MASTER_HOST}
-      REDIS_SENTINEL_MASTER_NAME: ${REDIS_SENTINEL_MASTER_NAME}
-      REDIS_SENTINEL_ADDRS: ${REDIS_SENTINEL_ADDRS}
       REDIS_MAXCLIENTS: ${REDIS_MAXCLIENTS}
     volumes:
       - redis_data:/data
