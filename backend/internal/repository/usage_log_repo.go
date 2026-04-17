@@ -1775,7 +1775,7 @@ func (r *usageLogRepository) GetUserStatsAggregated(ctx context.Context, userID 
 	var stats usagestats.UsageStats
 	if err := scanSingleRow(
 		ctx,
-		r.sql,
+		r.readSQL(),
 		query,
 		[]any{userID, startTime, endTime},
 		&stats.TotalRequests,
@@ -1810,7 +1810,7 @@ func (r *usageLogRepository) GetAPIKeyStatsAggregated(ctx context.Context, apiKe
 	var stats usagestats.UsageStats
 	if err := scanSingleRow(
 		ctx,
-		r.sql,
+		r.readSQL(),
 		query,
 		[]any{apiKeyID, startTime, endTime},
 		&stats.TotalRequests,
