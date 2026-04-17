@@ -12,14 +12,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type ReaderEntClient struct {
-	Client *ent.Client
-}
-
-type ReaderSQLDB struct {
-	DB *sql.DB
-}
-
 // ProvideConcurrencyCache 创建并发控制缓存，从配置读取 TTL 参数
 // 性能优化：TTL 可配置，支持长时间运行的 LLM 请求场景
 func ProvideConcurrencyCache(rdb *redis.Client, cfg *config.Config) service.ConcurrencyCache {
@@ -143,11 +135,8 @@ var ProviderSet = wire.NewSet(
 	NewGeminiCliCodeAssistClient,
 	NewGeminiDriveClient,
 
-	ProvideEntBundle,
 	ProvideEnt,
 	ProvideSQLDB,
-	ProvideReaderEnt,
-	ProvideReaderSQLDB,
 	ProvideRedis,
 )
 
@@ -158,15 +147,9 @@ var ProviderSet = wire.NewSet(
 //
 // 依赖：config.Config
 // 提供：*ent.Client
-func ProvideEntBundle(cfg *config.Config) (*EntBundle, error) {
-	return InitEntBundle(cfg)
-}
-
-func ProvideEnt(bundle *EntBundle) (*ent.Client, error) {
-	if bundle == nil || bundle.WriterClient == nil {
-		return nil, errors.New("nil writer ent client")
-	}
-	return bundle.WriterClient, nil
+func ProvideEnt(cfg *config.Config) (*ent.Client, error) {
+	client, _, err := InitEnt(cfg)
+	return client, err
 }
 
 // ProvideSQLDB 从 Ent 客户端提取底层的 *sql.DB 连接。
@@ -180,32 +163,17 @@ func ProvideEnt(bundle *EntBundle) (*ent.Client, error) {
 //
 // 依赖：*ent.Client
 // 提供：*sql.DB
-
-func ProvideSQLDB(bundle *EntBundle) (*sql.DB, error) {
-	if bundle == nil || bundle.WriterClient == nil {
-		return nil, errors.New("nil writer ent client")
+func ProvideSQLDB(client *ent.Client) (*sql.DB, error) {
+	if client == nil {
+		return nil, errors.New("nil ent client")
 	}
 	// 从 Ent 客户端获取底层驱动
-	drv, ok := bundle.WriterClient.Driver().(*entsql.Driver)
+	drv, ok := client.Driver().(*entsql.Driver)
 	if !ok {
 		return nil, errors.New("ent driver does not expose *sql.DB")
 	}
 	// 返回驱动持有的 sql.DB 实例
 	return drv.DB(), nil
-}
-
-func ProvideReaderEnt(bundle *EntBundle) *ReaderEntClient {
-	if bundle == nil || bundle.ReaderClient == nil {
-		return &ReaderEntClient{}
-	}
-	return &ReaderEntClient{Client: bundle.ReaderClient}
-}
-
-func ProvideReaderSQLDB(bundle *EntBundle) *ReaderSQLDB {
-	if bundle == nil || bundle.ReaderDB == nil {
-		return &ReaderSQLDB{}
-	}
-	return &ReaderSQLDB{DB: bundle.ReaderDB}
 }
 
 // ProvideRedis 为依赖注入提供 Redis 客户端。

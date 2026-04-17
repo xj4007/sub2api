@@ -28,7 +28,7 @@ const (
 
 // DefaultCSPPolicy is the default Content-Security-Policy with nonce support
 // __CSP_NONCE__ will be replaced with actual nonce at request time by the SecurityHeaders middleware
-const DefaultCSPPolicy = "default-src 'self'; script-src 'self' __CSP_NONCE__ https://challenges.cloudflare.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https:; frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+const DefaultCSPPolicy = "default-src 'self'; script-src 'self' __CSP_NONCE__ https://challenges.cloudflare.com https://static.cloudflareinsights.com https://*.stripe.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https:; frame-src https://challenges.cloudflare.com https://*.stripe.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
 
 // UMQ（用户消息队列）模式常量
 const (
@@ -694,16 +694,12 @@ func (s *ServerConfig) Address() string {
 // DatabaseConfig 数据库连接配置
 // 性能优化：新增连接池参数，避免频繁创建/销毁连接
 type DatabaseConfig struct {
-	Host                     string `mapstructure:"host"`
-	Port                     int    `mapstructure:"port"`
-	User                     string `mapstructure:"user"`
-	Password                 string `mapstructure:"password"`
-	DBName                   string `mapstructure:"dbname"`
-	SSLMode                  string `mapstructure:"sslmode"`
-	TargetSessionAttrs       string `mapstructure:"target_session_attrs"`
-	ReaderHost               string `mapstructure:"reader_host"`
-	ReaderPort               int    `mapstructure:"reader_port"`
-	ReaderTargetSessionAttrs string `mapstructure:"reader_target_session_attrs"`
+	Host     string `mapstructure:"host"`
+	Port     int    `mapstructure:"port"`
+	User     string `mapstructure:"user"`
+	Password string `mapstructure:"password"`
+	DBName   string `mapstructure:"dbname"`
+	SSLMode  string `mapstructure:"sslmode"`
 	// 连接池配置（性能优化：可配置化连接池参数）
 	// MaxOpenConns: 最大打开连接数，控制数据库连接上限，防止资源耗尽
 	MaxOpenConns int `mapstructure:"max_open_conns"`
@@ -716,7 +712,17 @@ type DatabaseConfig struct {
 }
 
 func (d *DatabaseConfig) DSN() string {
-	return d.dsnFor(d.Host, d.Port, d.TargetSessionAttrs, "")
+	// 当密码为空时不包含 password 参数，避免 libpq 解析错误
+	if d.Password == "" {
+		return fmt.Sprintf(
+			"host=%s port=%d user=%s dbname=%s sslmode=%s",
+			d.Host, d.Port, d.User, d.DBName, d.SSLMode,
+		)
+	}
+	return fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode,
+	)
 }
 
 // DSNWithTimezone returns DSN with timezone setting
@@ -724,55 +730,26 @@ func (d *DatabaseConfig) DSNWithTimezone(tz string) string {
 	if tz == "" {
 		tz = "Asia/Shanghai"
 	}
-	return d.dsnFor(d.Host, d.Port, d.TargetSessionAttrs, tz)
-}
-
-func (d *DatabaseConfig) ReaderDSN() string {
-	if strings.TrimSpace(d.ReaderHost) == "" {
-		return d.DSN()
+	// 当密码为空时不包含 password 参数，避免 libpq 解析错误
+	if d.Password == "" {
+		return fmt.Sprintf(
+			"host=%s port=%d user=%s dbname=%s sslmode=%s TimeZone=%s",
+			d.Host, d.Port, d.User, d.DBName, d.SSLMode, tz,
+		)
 	}
-	return d.dsnFor(d.ReaderHost, d.ReaderPort, d.ReaderTargetSessionAttrs, "")
-}
-
-func (d *DatabaseConfig) ReaderDSNWithTimezone(tz string) string {
-	if strings.TrimSpace(d.ReaderHost) == "" {
-		return d.DSNWithTimezone(tz)
-	}
-	if tz == "" {
-		tz = "Asia/Shanghai"
-	}
-	return d.dsnFor(d.ReaderHost, d.ReaderPort, d.ReaderTargetSessionAttrs, tz)
-}
-
-func (d *DatabaseConfig) dsnFor(host string, port int, targetSessionAttrs string, tz string) string {
-	targetSessionAttrs = strings.TrimSpace(targetSessionAttrs)
-	base := "host=%s port=%d user=%s dbname=%s sslmode=%s"
-	args := []any{host, port, d.User, d.DBName, d.SSLMode}
-	if d.Password != "" {
-		base = "host=%s port=%d user=%s password=%s dbname=%s sslmode=%s"
-		args = []any{host, port, d.User, d.Password, d.DBName, d.SSLMode}
-	}
-	if tz != "" {
-		base += " TimeZone=%s"
-		args = append(args, tz)
-	}
-	dsn := fmt.Sprintf(base, args...)
-	if targetSessionAttrs != "" {
-		dsn += fmt.Sprintf(" target_session_attrs=%s", targetSessionAttrs)
-	}
-	return dsn
+	return fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s TimeZone=%s",
+		d.Host, d.Port, d.User, d.Password, d.DBName, d.SSLMode, tz,
+	)
 }
 
 // RedisConfig Redis 连接配置
 // 性能优化：新增连接池和超时参数，提升高并发场景下的吞吐量
 type RedisConfig struct {
-	Host               string `mapstructure:"host"`
-	Port               int    `mapstructure:"port"`
-	Password           string `mapstructure:"password"`
-	DB                 int    `mapstructure:"db"`
-	SentinelEnabled    bool   `mapstructure:"sentinel_enabled"`
-	SentinelMasterName string `mapstructure:"sentinel_master_name"`
-	SentinelAddrs      string `mapstructure:"sentinel_addrs"`
+	Host     string `mapstructure:"host"`
+	Port     int    `mapstructure:"port"`
+	Password string `mapstructure:"password"`
+	DB       int    `mapstructure:"db"`
 	// 连接池与超时配置（性能优化：可配置化连接池参数）
 	// DialTimeoutSeconds: 建立连接超时，防止慢连接阻塞
 	DialTimeoutSeconds int `mapstructure:"dial_timeout_seconds"`
@@ -790,13 +767,6 @@ type RedisConfig struct {
 
 func (r *RedisConfig) Address() string {
 	return fmt.Sprintf("%s:%d", r.Host, r.Port)
-}
-
-func (r *RedisConfig) SentinelAddresses() []string {
-	if strings.TrimSpace(r.SentinelAddrs) == "" {
-		return nil
-	}
-	return normalizeStringSlice(strings.Split(r.SentinelAddrs, ","))
 }
 
 type OpsConfig struct {
@@ -1055,11 +1025,6 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	cfg.OIDC.UserInfoIDPath = strings.TrimSpace(cfg.OIDC.UserInfoIDPath)
 	cfg.OIDC.UserInfoUsernamePath = strings.TrimSpace(cfg.OIDC.UserInfoUsernamePath)
 	cfg.Dashboard.KeyPrefix = strings.TrimSpace(cfg.Dashboard.KeyPrefix)
-	cfg.Database.TargetSessionAttrs = strings.ToLower(strings.TrimSpace(cfg.Database.TargetSessionAttrs))
-	cfg.Database.ReaderHost = strings.TrimSpace(cfg.Database.ReaderHost)
-	cfg.Database.ReaderTargetSessionAttrs = strings.ToLower(strings.TrimSpace(cfg.Database.ReaderTargetSessionAttrs))
-	cfg.Redis.SentinelMasterName = strings.TrimSpace(cfg.Redis.SentinelMasterName)
-	cfg.Redis.SentinelAddrs = strings.Join(cfg.Redis.SentinelAddresses(), ",")
 	cfg.CORS.AllowedOrigins = normalizeStringSlice(cfg.CORS.AllowedOrigins)
 	cfg.Security.ResponseHeaders.AdditionalAllowed = normalizeStringSlice(cfg.Security.ResponseHeaders.AdditionalAllowed)
 	cfg.Security.ResponseHeaders.ForceRemove = normalizeStringSlice(cfg.Security.ResponseHeaders.ForceRemove)
@@ -1268,10 +1233,6 @@ func setDefaults() {
 	viper.SetDefault("database.password", "postgres")
 	viper.SetDefault("database.dbname", "sub2api")
 	viper.SetDefault("database.sslmode", "prefer")
-	viper.SetDefault("database.target_session_attrs", "")
-	viper.SetDefault("database.reader_host", "")
-	viper.SetDefault("database.reader_port", 5432)
-	viper.SetDefault("database.reader_target_session_attrs", "")
 	viper.SetDefault("database.max_open_conns", 256)
 	viper.SetDefault("database.max_idle_conns", 128)
 	viper.SetDefault("database.conn_max_lifetime_minutes", 30)
@@ -1282,9 +1243,6 @@ func setDefaults() {
 	viper.SetDefault("redis.port", 6379)
 	viper.SetDefault("redis.password", "")
 	viper.SetDefault("redis.db", 0)
-	viper.SetDefault("redis.sentinel_enabled", false)
-	viper.SetDefault("redis.sentinel_master_name", "")
-	viper.SetDefault("redis.sentinel_addrs", "")
 	viper.SetDefault("redis.dial_timeout_seconds", 5)
 	viper.SetDefault("redis.read_timeout_seconds", 3)
 	viper.SetDefault("redis.write_timeout_seconds", 3)
@@ -1799,31 +1757,6 @@ func (c *Config) Validate() error {
 	if c.Database.MaxOpenConns <= 0 {
 		return fmt.Errorf("database.max_open_conns must be positive")
 	}
-	if strings.TrimSpace(c.Database.Host) == "" {
-		return fmt.Errorf("database.host is required")
-	}
-	if c.Database.Port <= 0 {
-		return fmt.Errorf("database.port must be positive")
-	}
-	if targetSessionAttrs := strings.TrimSpace(c.Database.TargetSessionAttrs); targetSessionAttrs != "" {
-		switch targetSessionAttrs {
-		case "any", "read-write", "read-only", "primary", "standby", "prefer-standby":
-		default:
-			return fmt.Errorf("database.target_session_attrs must be one of: any/read-write/read-only/primary/standby/prefer-standby")
-		}
-	}
-	if readerHost := strings.TrimSpace(c.Database.ReaderHost); readerHost != "" {
-		if c.Database.ReaderPort <= 0 {
-			return fmt.Errorf("database.reader_port must be positive when database.reader_host is set")
-		}
-		if targetSessionAttrs := strings.TrimSpace(c.Database.ReaderTargetSessionAttrs); targetSessionAttrs != "" {
-			switch targetSessionAttrs {
-			case "any", "read-write", "read-only", "primary", "standby", "prefer-standby":
-			default:
-				return fmt.Errorf("database.reader_target_session_attrs must be one of: any/read-write/read-only/primary/standby/prefer-standby")
-			}
-		}
-	}
 	if c.Database.MaxIdleConns < 0 {
 		return fmt.Errorf("database.max_idle_conns must be non-negative")
 	}
@@ -1838,21 +1771,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Redis.DialTimeoutSeconds <= 0 {
 		return fmt.Errorf("redis.dial_timeout_seconds must be positive")
-	}
-	if !c.Redis.SentinelEnabled {
-		if strings.TrimSpace(c.Redis.Host) == "" {
-			return fmt.Errorf("redis.host is required when redis.sentinel_enabled=false")
-		}
-		if c.Redis.Port <= 0 {
-			return fmt.Errorf("redis.port must be positive when redis.sentinel_enabled=false")
-		}
-	} else {
-		if strings.TrimSpace(c.Redis.SentinelMasterName) == "" {
-			return fmt.Errorf("redis.sentinel_master_name is required when redis.sentinel_enabled=true")
-		}
-		if len(c.Redis.SentinelAddresses()) == 0 {
-			return fmt.Errorf("redis.sentinel_addrs is required when redis.sentinel_enabled=true")
-		}
 	}
 	if c.Redis.ReadTimeoutSeconds <= 0 {
 		return fmt.Errorf("redis.read_timeout_seconds must be positive")

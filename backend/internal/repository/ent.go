@@ -6,7 +6,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/ent"
@@ -18,13 +17,6 @@ import (
 	entsql "entgo.io/ent/dialect/sql"
 	_ "github.com/lib/pq" // PostgreSQL 驱动，通过副作用导入注册驱动
 )
-
-type EntBundle struct {
-	WriterClient *ent.Client
-	WriterDB     *sql.DB
-	ReaderClient *ent.Client
-	ReaderDB     *sql.DB
-}
 
 // InitEnt 初始化 Ent ORM 客户端并返回客户端实例和底层的 *sql.DB。
 //
@@ -44,18 +36,10 @@ type EntBundle struct {
 //   - *sql.DB: 底层的 SQL 数据库连接，可用于直接执行原生 SQL
 //   - error: 初始化过程中的错误
 func InitEnt(cfg *config.Config) (*ent.Client, *sql.DB, error) {
-	bundle, err := InitEntBundle(cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-	return bundle.WriterClient, bundle.WriterDB, nil
-}
-
-func InitEntBundle(cfg *config.Config) (*EntBundle, error) {
 	// 优先初始化时区设置，确保所有时间操作使用统一的时区。
 	// 这对于跨时区部署和日志时间戳的一致性至关重要。
 	if err := timezone.Init(cfg.Timezone); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// 构建包含时区信息的数据库连接字符串 (DSN)。
@@ -66,7 +50,7 @@ func InitEntBundle(cfg *config.Config) (*EntBundle, error) {
 	// dialect.Postgres 指定使用 PostgreSQL 方言进行 SQL 生成。
 	drv, err := entsql.Open(dialect.Postgres, dsn)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	applyDBPoolSettings(drv.DB(), cfg)
 
@@ -77,7 +61,7 @@ func InitEntBundle(cfg *config.Config) (*EntBundle, error) {
 	defer cancel()
 	if err := applyMigrationsFS(migrationCtx, drv.DB(), migrations.FS); err != nil {
 		_ = drv.Close() // 迁移失败时关闭驱动，避免资源泄露
-		return nil, err
+		return nil, nil, err
 	}
 
 	// 创建 Ent 客户端，绑定到已配置的数据库驱动。
@@ -86,13 +70,13 @@ func InitEntBundle(cfg *config.Config) (*EntBundle, error) {
 	// 启动阶段：从配置或数据库中确保系统密钥可用。
 	if err := ensureBootstrapSecrets(migrationCtx, client, cfg); err != nil {
 		_ = client.Close()
-		return nil, err
+		return nil, nil, err
 	}
 
 	// 在密钥补齐后执行完整配置校验，避免空 jwt.secret 导致服务运行时失败。
 	if err := cfg.Validate(); err != nil {
 		_ = client.Close()
-		return nil, fmt.Errorf("validate config after secret bootstrap: %w", err)
+		return nil, nil, fmt.Errorf("validate config after secret bootstrap: %w", err)
 	}
 
 	// SIMPLE 模式：启动时补齐各平台默认分组。
@@ -103,27 +87,13 @@ func InitEntBundle(cfg *config.Config) (*EntBundle, error) {
 		defer seedCancel()
 		if err := ensureSimpleModeDefaultGroups(seedCtx, client); err != nil {
 			_ = client.Close()
-			return nil, err
+			return nil, nil, err
 		}
 		if err := ensureSimpleModeAdminConcurrency(seedCtx, client); err != nil {
 			_ = client.Close()
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
-	bundle := &EntBundle{WriterClient: client, WriterDB: drv.DB()}
-	if strings.TrimSpace(cfg.Database.ReaderHost) == "" {
-		return bundle, nil
-	}
-
-	readerDrv, err := entsql.Open(dialect.Postgres, cfg.Database.ReaderDSNWithTimezone(cfg.Timezone))
-	if err != nil {
-		_ = client.Close()
-		return nil, err
-	}
-	applyDBPoolSettings(readerDrv.DB(), cfg)
-	bundle.ReaderClient = ent.NewClient(ent.Driver(readerDrv))
-	bundle.ReaderDB = readerDrv.DB()
-
-	return bundle, nil
+	return client, drv.DB(), nil
 }

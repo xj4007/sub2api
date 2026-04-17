@@ -4,9 +4,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 func TestDecideAdminBootstrap(t *testing.T) {
@@ -89,84 +86,4 @@ func TestWriteConfigFileKeepsDefaultUserConcurrency(t *testing.T) {
 	if !strings.Contains(string(data), "user_concurrency: 5") {
 		t.Fatalf("config missing default user concurrency, got:\n%s", string(data))
 	}
-}
-
-func TestBuildPostgresDSN(t *testing.T) {
-	cfg := &DatabaseConfig{
-		Host:               "pgproxy",
-		Port:               5432,
-		User:               "sub2api",
-		Password:           "secret",
-		DBName:             "sub2api",
-		SSLMode:            "disable",
-		TargetSessionAttrs: "read-write",
-	}
-
-	defaultDSN := buildPostgresDSN(cfg, "postgres")
-	if !strings.Contains(defaultDSN, "dbname=postgres") {
-		t.Fatalf("default DSN should connect to postgres database, got %q", defaultDSN)
-	}
-	if !strings.Contains(defaultDSN, "target_session_attrs=read-write") {
-		t.Fatalf("default DSN should keep target_session_attrs, got %q", defaultDSN)
-	}
-
-	targetDSN := buildPostgresDSN(cfg, cfg.DBName)
-	if !strings.Contains(targetDSN, "dbname=sub2api") {
-		t.Fatalf("target DSN should connect to target database, got %q", targetDSN)
-	}
-}
-
-func TestBuildRedisUniversalOptionsUsesSentinel(t *testing.T) {
-	cfg := &RedisConfig{
-		Host:               "localhost",
-		Port:               6379,
-		Password:           "secret",
-		DB:                 2,
-		EnableTLS:          true,
-		SentinelEnabled:    true,
-		SentinelMasterName: "sub2api-redis",
-		SentinelAddrs:      "10.0.0.1:26379,10.0.0.2:26379,10.0.0.3:26379",
-	}
-
-	opts := buildRedisUniversalOptions(cfg)
-	if opts.MasterName != "sub2api-redis" {
-		t.Fatalf("MasterName=%q", opts.MasterName)
-	}
-	if len(opts.Addrs) != 3 {
-		t.Fatalf("Addrs=%v", opts.Addrs)
-	}
-	if opts.Addrs[0] != "10.0.0.1:26379" || opts.Addrs[2] != "10.0.0.3:26379" {
-		t.Fatalf("Addrs=%v", opts.Addrs)
-	}
-	if opts.DB != 2 || opts.Password != "secret" {
-		t.Fatalf("unexpected redis options: %#v", opts)
-	}
-	if opts.TLSConfig == nil {
-		t.Fatalf("expected TLS config in sentinel mode")
-	}
-
-	client := buildRedisClient(cfg)
-	if client == nil {
-		t.Fatalf("expected redis client")
-	}
-	_ = client.Close()
-
-	standalone := buildRedisUniversalOptions(&RedisConfig{Host: "redis", Port: 6379, Password: "pw", DB: 1})
-	if standalone.MasterName != "" {
-		t.Fatalf("standalone options should not set master name")
-	}
-	if len(standalone.Addrs) != 1 || standalone.Addrs[0] != "redis:6379" {
-		t.Fatalf("standalone addrs=%v", standalone.Addrs)
-	}
-	if standalone.DialTimeout != 5*time.Second {
-		t.Fatalf("standalone dial timeout=%v", standalone.DialTimeout)
-	}
-}
-
-func TestBuildRedisClientReturnsUniversalClient(t *testing.T) {
-	client := buildRedisClient(&RedisConfig{Host: "redis", Port: 6379})
-	if _, ok := client.(redis.UniversalClient); !ok {
-		t.Fatalf("expected universal client implementation")
-	}
-	_ = client.Close()
 }

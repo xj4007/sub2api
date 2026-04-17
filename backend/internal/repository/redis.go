@@ -21,13 +21,6 @@ import (
 // 2. MinIdleConns: 保持最小空闲连接，减少冷启动延迟（默认 10）
 // 3. DialTimeout/ReadTimeout/WriteTimeout: 精确控制各阶段超时
 func InitRedis(cfg *config.Config) *redis.Client {
-	return buildRedisClient(cfg)
-}
-
-func buildRedisClient(cfg *config.Config) *redis.Client {
-	if cfg.Redis.SentinelEnabled {
-		return redis.NewFailoverClient(buildRedisFailoverOptions(cfg))
-	}
 	return redis.NewClient(buildRedisOptions(cfg))
 }
 
@@ -49,28 +42,6 @@ func buildRedisOptions(cfg *config.Config) *redis.Options {
 		opts.TLSConfig = &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			ServerName: cfg.Redis.Host,
-		}
-	}
-
-	return opts
-}
-
-func buildRedisFailoverOptions(cfg *config.Config) *redis.FailoverOptions {
-	opts := &redis.FailoverOptions{
-		MasterName:    cfg.Redis.SentinelMasterName,
-		SentinelAddrs: cfg.Redis.SentinelAddresses(),
-		Password:      cfg.Redis.Password,
-		DB:            cfg.Redis.DB,
-		DialTimeout:   time.Duration(cfg.Redis.DialTimeoutSeconds) * time.Second,
-		ReadTimeout:   time.Duration(cfg.Redis.ReadTimeoutSeconds) * time.Second,
-		WriteTimeout:  time.Duration(cfg.Redis.WriteTimeoutSeconds) * time.Second,
-		PoolSize:      cfg.Redis.PoolSize,
-		MinIdleConns:  cfg.Redis.MinIdleConns,
-	}
-
-	if cfg.Redis.EnableTLS {
-		opts.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
 		}
 	}
 

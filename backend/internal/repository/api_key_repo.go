@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
@@ -14,41 +15,26 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
+
+	entsql "entgo.io/ent/dialect/sql"
 )
 
 type apiKeyRepository struct {
-	client       *dbent.Client
-	sql          sqlExecutor
-	readerClient *dbent.Client
+	client *dbent.Client
+	sql    sqlExecutor
 }
 
-func NewAPIKeyRepository(client *dbent.Client, sqlDB *sql.DB, readerClient *ReaderEntClient) service.APIKeyRepository {
-	return newAPIKeyRepositoryWithSQL(client, sqlDB, readerClient)
+func NewAPIKeyRepository(client *dbent.Client, sqlDB *sql.DB) service.APIKeyRepository {
+	return newAPIKeyRepositoryWithSQL(client, sqlDB)
 }
 
-func newAPIKeyRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor, readerClient *ReaderEntClient) *apiKeyRepository {
-	repo := &apiKeyRepository{client: client, sql: sqlq}
-	if readerClient != nil {
-		repo.readerClient = readerClient.Client
-	}
-	return repo
+func newAPIKeyRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *apiKeyRepository {
+	return &apiKeyRepository{client: client, sql: sqlq}
 }
 
 func (r *apiKeyRepository) activeQuery() *dbent.APIKeyQuery {
 	// 默认过滤已软删除记录，避免删除后仍被查询到。
 	return r.client.APIKey.Query().Where(apikey.DeletedAtIsNil())
-}
-
-func (r *apiKeyRepository) readClient(ctx context.Context) *dbent.Client {
-	defaultClient := r.client
-	if r != nil && r.readerClient != nil {
-		defaultClient = r.readerClient
-	}
-	return clientFromContext(ctx, defaultClient)
-}
-
-func (r *apiKeyRepository) readActiveQuery(ctx context.Context) *dbent.APIKeyQuery {
-	return r.readClient(ctx).APIKey.Query().Where(apikey.DeletedAtIsNil())
 }
 
 func (r *apiKeyRepository) Create(ctx context.Context, key *service.APIKey) error {
@@ -152,10 +138,17 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 		WithUser(func(q *dbent.UserQuery) {
 			q.Select(
 				user.FieldID,
+				user.FieldEmail,
+				user.FieldUsername,
 				user.FieldStatus,
 				user.FieldRole,
 				user.FieldBalance,
 				user.FieldConcurrency,
+				user.FieldBalanceNotifyEnabled,
+				user.FieldBalanceNotifyThresholdType,
+				user.FieldBalanceNotifyThreshold,
+				user.FieldBalanceNotifyExtraEmails,
+				user.FieldTotalRecharged,
 			)
 		}).
 		WithGroup(func(q *dbent.GroupQuery) {
@@ -181,6 +174,7 @@ func (r *apiKeyRepository) GetByKeyForAuth(ctx context.Context, key string) (*se
 				group.FieldSupportedModelScopes,
 				group.FieldAllowMessagesDispatch,
 				group.FieldDefaultMappedModel,
+				group.FieldMessagesDispatchModelConfig,
 			)
 		}).
 		Only(ctx)
@@ -301,7 +295,7 @@ func (r *apiKeyRepository) Delete(ctx context.Context, id int64) error {
 }
 
 func (r *apiKeyRepository) ListByUserID(ctx context.Context, userID int64, params pagination.PaginationParams, filters service.APIKeyListFilters) ([]service.APIKey, *pagination.PaginationResult, error) {
-	q := r.readActiveQuery(ctx).Where(apikey.UserIDEQ(userID))
+	q := r.activeQuery().Where(apikey.UserIDEQ(userID))
 
 	// Apply filters
 	if filters.Search != "" {
@@ -326,12 +320,15 @@ func (r *apiKeyRepository) ListByUserID(ctx context.Context, userID int64, param
 		return nil, nil, err
 	}
 
-	keys, err := q.
+	keysQuery := q.
 		WithGroup().
 		Offset(params.Offset()).
-		Limit(params.Limit()).
-		Order(dbent.Desc(apikey.FieldID)).
-		All(ctx)
+		Limit(params.Limit())
+	for _, order := range apiKeyListOrder(params) {
+		keysQuery = keysQuery.Order(order)
+	}
+
+	keys, err := keysQuery.All(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -376,12 +373,15 @@ func (r *apiKeyRepository) ListByGroupID(ctx context.Context, groupID int64, par
 		return nil, nil, err
 	}
 
-	keys, err := q.
+	keysQuery := q.
 		WithUser().
 		Offset(params.Offset()).
-		Limit(params.Limit()).
-		Order(dbent.Desc(apikey.FieldID)).
-		All(ctx)
+		Limit(params.Limit())
+	for _, order := range apiKeyListOrder(params) {
+		keysQuery = keysQuery.Order(order)
+	}
+
+	keys, err := keysQuery.All(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -392,6 +392,32 @@ func (r *apiKeyRepository) ListByGroupID(ctx context.Context, groupID int64, par
 	}
 
 	return outKeys, paginationResultFromTotal(int64(total), params), nil
+}
+
+func apiKeyListOrder(params pagination.PaginationParams) []func(*entsql.Selector) {
+	sortBy := strings.ToLower(strings.TrimSpace(params.SortBy))
+	sortOrder := params.NormalizedSortOrder(pagination.SortOrderDesc)
+
+	var field string
+	switch sortBy {
+	case "name":
+		field = apikey.FieldName
+	case "status":
+		field = apikey.FieldStatus
+	case "expires_at":
+		field = apikey.FieldExpiresAt
+	case "last_used_at":
+		field = apikey.FieldLastUsedAt
+	case "created_at":
+		field = apikey.FieldCreatedAt
+	default:
+		field = apikey.FieldID
+	}
+
+	if sortOrder == pagination.SortOrderAsc {
+		return []func(*entsql.Selector){dbent.Asc(field), dbent.Asc(apikey.FieldID)}
+	}
+	return []func(*entsql.Selector){dbent.Desc(field), dbent.Desc(apikey.FieldID)}
 }
 
 // SearchAPIKeys searches API keys by user ID and/or keyword (name)
@@ -620,22 +646,31 @@ func userEntityToService(u *dbent.User) *service.User {
 	if u == nil {
 		return nil
 	}
-	return &service.User{
-		ID:                  u.ID,
-		Email:               u.Email,
-		Username:            u.Username,
-		Notes:               u.Notes,
-		PasswordHash:        u.PasswordHash,
-		Role:                u.Role,
-		Balance:             u.Balance,
-		Concurrency:         u.Concurrency,
-		Status:              u.Status,
-		TotpSecretEncrypted: u.TotpSecretEncrypted,
-		TotpEnabled:         u.TotpEnabled,
-		TotpEnabledAt:       u.TotpEnabledAt,
-		CreatedAt:           u.CreatedAt,
-		UpdatedAt:           u.UpdatedAt,
+	out := &service.User{
+		ID:                         u.ID,
+		Email:                      u.Email,
+		Username:                   u.Username,
+		Notes:                      u.Notes,
+		PasswordHash:               u.PasswordHash,
+		Role:                       u.Role,
+		Balance:                    u.Balance,
+		Concurrency:                u.Concurrency,
+		Status:                     u.Status,
+		TotpSecretEncrypted:        u.TotpSecretEncrypted,
+		TotpEnabled:                u.TotpEnabled,
+		TotpEnabledAt:              u.TotpEnabledAt,
+		BalanceNotifyEnabled:       u.BalanceNotifyEnabled,
+		BalanceNotifyThresholdType: u.BalanceNotifyThresholdType,
+		BalanceNotifyThreshold:     u.BalanceNotifyThreshold,
+		TotalRecharged:             u.TotalRecharged,
+		CreatedAt:                  u.CreatedAt,
+		UpdatedAt:                  u.UpdatedAt,
 	}
+	// Parse extra emails JSON (supports both old []string and new []NotifyEmailEntry format)
+	if u.BalanceNotifyExtraEmails != "" && u.BalanceNotifyExtraEmails != "[]" {
+		out.BalanceNotifyExtraEmails = service.ParseNotifyEmails(u.BalanceNotifyExtraEmails)
+	}
+	return out
 }
 
 func groupEntityToService(g *dbent.Group) *service.Group {
@@ -671,6 +706,7 @@ func groupEntityToService(g *dbent.Group) *service.Group {
 		RequireOAuthOnly:                g.RequireOauthOnly,
 		RequirePrivacySet:               g.RequirePrivacySet,
 		DefaultMappedModel:              g.DefaultMappedModel,
+		MessagesDispatchModelConfig:     g.MessagesDispatchModelConfig,
 		CreatedAt:                       g.CreatedAt,
 		UpdatedAt:                       g.UpdatedAt,
 	}

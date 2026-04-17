@@ -12,24 +12,11 @@ import (
 )
 
 type userSubscriptionRepository struct {
-	client       *dbent.Client
-	readerClient *dbent.Client
+	client *dbent.Client
 }
 
-func NewUserSubscriptionRepository(client *dbent.Client, readerClient *ReaderEntClient) service.UserSubscriptionRepository {
-	repo := &userSubscriptionRepository{client: client}
-	if readerClient != nil {
-		repo.readerClient = readerClient.Client
-	}
-	return repo
-}
-
-func (r *userSubscriptionRepository) readClient(ctx context.Context) *dbent.Client {
-	defaultClient := r.client
-	if r != nil && r.readerClient != nil {
-		defaultClient = r.readerClient
-	}
-	return clientFromContext(ctx, defaultClient)
+func NewUserSubscriptionRepository(client *dbent.Client) service.UserSubscriptionRepository {
+	return &userSubscriptionRepository{client: client}
 }
 
 func (r *userSubscriptionRepository) Create(ctx context.Context, sub *service.UserSubscription) error {
@@ -72,7 +59,7 @@ func (r *userSubscriptionRepository) Create(ctx context.Context, sub *service.Us
 }
 
 func (r *userSubscriptionRepository) GetByID(ctx context.Context, id int64) (*service.UserSubscription, error) {
-	client := r.readClient(ctx)
+	client := clientFromContext(ctx, r.client)
 	m, err := client.UserSubscription.Query().
 		Where(usersubscription.IDEQ(id)).
 		WithUser().
@@ -152,7 +139,7 @@ func (r *userSubscriptionRepository) Delete(ctx context.Context, id int64) error
 }
 
 func (r *userSubscriptionRepository) ListByUserID(ctx context.Context, userID int64) ([]service.UserSubscription, error) {
-	client := r.readClient(ctx)
+	client := clientFromContext(ctx, r.client)
 	subs, err := client.UserSubscription.Query().
 		Where(usersubscription.UserIDEQ(userID)).
 		WithGroup().
@@ -165,7 +152,7 @@ func (r *userSubscriptionRepository) ListByUserID(ctx context.Context, userID in
 }
 
 func (r *userSubscriptionRepository) ListActiveByUserID(ctx context.Context, userID int64) ([]service.UserSubscription, error) {
-	client := r.readClient(ctx)
+	client := clientFromContext(ctx, r.client)
 	subs, err := client.UserSubscription.Query().
 		Where(
 			usersubscription.UserIDEQ(userID),

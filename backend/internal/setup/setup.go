@@ -82,24 +82,20 @@ type SetupConfig struct {
 }
 
 type DatabaseConfig struct {
-	Host               string `json:"host" yaml:"host"`
-	Port               int    `json:"port" yaml:"port"`
-	User               string `json:"user" yaml:"user"`
-	Password           string `json:"password" yaml:"password"`
-	DBName             string `json:"dbname" yaml:"dbname"`
-	SSLMode            string `json:"sslmode" yaml:"sslmode"`
-	TargetSessionAttrs string `json:"target_session_attrs,omitempty" yaml:"target_session_attrs,omitempty"`
+	Host     string `json:"host" yaml:"host"`
+	Port     int    `json:"port" yaml:"port"`
+	User     string `json:"user" yaml:"user"`
+	Password string `json:"password" yaml:"password"`
+	DBName   string `json:"dbname" yaml:"dbname"`
+	SSLMode  string `json:"sslmode" yaml:"sslmode"`
 }
 
 type RedisConfig struct {
-	Host               string `json:"host" yaml:"host"`
-	Port               int    `json:"port" yaml:"port"`
-	Password           string `json:"password" yaml:"password"`
-	DB                 int    `json:"db" yaml:"db"`
-	EnableTLS          bool   `json:"enable_tls" yaml:"enable_tls"`
-	SentinelEnabled    bool   `json:"sentinel_enabled,omitempty" yaml:"sentinel_enabled,omitempty"`
-	SentinelMasterName string `json:"sentinel_master_name,omitempty" yaml:"sentinel_master_name,omitempty"`
-	SentinelAddrs      string `json:"sentinel_addrs,omitempty" yaml:"sentinel_addrs,omitempty"`
+	Host      string `json:"host" yaml:"host"`
+	Port      int    `json:"port" yaml:"port"`
+	Password  string `json:"password" yaml:"password"`
+	DB        int    `json:"db" yaml:"db"`
+	EnableTLS bool   `json:"enable_tls" yaml:"enable_tls"`
 }
 
 type AdminConfig struct {
@@ -167,7 +163,10 @@ func NeedsSetup() bool {
 // TestDatabaseConnection tests the database connection and creates database if not exists
 func TestDatabaseConnection(cfg *DatabaseConfig) error {
 	// First, connect to the default 'postgres' database to check/create target database
-	defaultDSN := buildPostgresDSN(cfg, "postgres")
+	defaultDSN := fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName, cfg.SSLMode,
+	)
 
 	db, err := sql.Open("postgres", defaultDSN)
 	if err != nil {
@@ -215,7 +214,10 @@ func TestDatabaseConnection(cfg *DatabaseConfig) error {
 	}
 	db = nil
 
-	targetDSN := buildPostgresDSN(cfg, cfg.DBName)
+	targetDSN := fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.DBName, cfg.SSLMode,
+	)
 
 	targetDB, err := sql.Open("postgres", targetDSN)
 	if err != nil {
@@ -240,7 +242,20 @@ func TestDatabaseConnection(cfg *DatabaseConfig) error {
 
 // TestRedisConnection tests the Redis connection
 func TestRedisConnection(cfg *RedisConfig) error {
-	rdb := buildRedisClient(cfg)
+	opts := &redis.Options{
+		Addr:     fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Password: cfg.Password,
+		DB:       cfg.DB,
+	}
+
+	if cfg.EnableTLS {
+		opts.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: cfg.Host,
+		}
+	}
+
+	rdb := redis.NewClient(opts)
 	defer func() {
 		if err := rdb.Close(); err != nil {
 			logger.LegacyPrintf("setup", "failed to close redis client: %v", err)
@@ -255,55 +270,6 @@ func TestRedisConnection(cfg *RedisConfig) error {
 	}
 
 	return nil
-}
-
-func buildPostgresDSN(cfg *DatabaseConfig, dbName string) string {
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host, cfg.Port, cfg.User, cfg.Password, dbName, cfg.SSLMode,
-	)
-	if strings.TrimSpace(cfg.TargetSessionAttrs) != "" {
-		dsn += fmt.Sprintf(" target_session_attrs=%s", strings.TrimSpace(cfg.TargetSessionAttrs))
-	}
-	return dsn
-}
-
-func buildRedisUniversalOptions(cfg *RedisConfig) *redis.UniversalOptions {
-	opts := &redis.UniversalOptions{
-		Addrs:        []string{fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)},
-		Password:     cfg.Password,
-		DB:           cfg.DB,
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
-	}
-
-	if cfg.SentinelEnabled {
-		opts.Addrs = splitAndTrim(cfg.SentinelAddrs)
-		opts.MasterName = strings.TrimSpace(cfg.SentinelMasterName)
-	}
-
-	if cfg.EnableTLS {
-		opts.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	}
-
-	return opts
-}
-
-func buildRedisClient(cfg *RedisConfig) redis.UniversalClient {
-	return redis.NewUniversalClient(buildRedisUniversalOptions(cfg))
-}
-
-func splitAndTrim(value string) []string {
-	parts := strings.Split(value, ",")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
 }
 
 // Install performs the installation with the given configuration
@@ -580,23 +546,19 @@ func AutoSetupFromEnv() error {
 	// Build config from environment variables
 	cfg := &SetupConfig{
 		Database: DatabaseConfig{
-			Host:               getEnvOrDefault("DATABASE_HOST", "localhost"),
-			Port:               getEnvIntOrDefault("DATABASE_PORT", 5432),
-			User:               getEnvOrDefault("DATABASE_USER", "postgres"),
-			Password:           getEnvOrDefault("DATABASE_PASSWORD", ""),
-			DBName:             getEnvOrDefault("DATABASE_DBNAME", "sub2api"),
-			SSLMode:            getEnvOrDefault("DATABASE_SSLMODE", "disable"),
-			TargetSessionAttrs: getEnvOrDefault("DATABASE_TARGET_SESSION_ATTRS", ""),
+			Host:     getEnvOrDefault("DATABASE_HOST", "localhost"),
+			Port:     getEnvIntOrDefault("DATABASE_PORT", 5432),
+			User:     getEnvOrDefault("DATABASE_USER", "postgres"),
+			Password: getEnvOrDefault("DATABASE_PASSWORD", ""),
+			DBName:   getEnvOrDefault("DATABASE_DBNAME", "sub2api"),
+			SSLMode:  getEnvOrDefault("DATABASE_SSLMODE", "disable"),
 		},
 		Redis: RedisConfig{
-			Host:               getEnvOrDefault("REDIS_HOST", "localhost"),
-			Port:               getEnvIntOrDefault("REDIS_PORT", 6379),
-			Password:           getEnvOrDefault("REDIS_PASSWORD", ""),
-			DB:                 getEnvIntOrDefault("REDIS_DB", 0),
-			EnableTLS:          getEnvOrDefault("REDIS_ENABLE_TLS", "false") == "true",
-			SentinelEnabled:    getEnvOrDefault("REDIS_SENTINEL_ENABLED", "false") == "true",
-			SentinelMasterName: getEnvOrDefault("REDIS_SENTINEL_MASTER_NAME", ""),
-			SentinelAddrs:      getEnvOrDefault("REDIS_SENTINEL_ADDRS", ""),
+			Host:      getEnvOrDefault("REDIS_HOST", "localhost"),
+			Port:      getEnvIntOrDefault("REDIS_PORT", 6379),
+			Password:  getEnvOrDefault("REDIS_PASSWORD", ""),
+			DB:        getEnvIntOrDefault("REDIS_DB", 0),
+			EnableTLS: getEnvOrDefault("REDIS_ENABLE_TLS", "false") == "true",
 		},
 		Admin: AdminConfig{
 			Email:    getEnvOrDefault("ADMIN_EMAIL", "admin@sub2api.local"),

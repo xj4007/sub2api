@@ -26,7 +26,7 @@ func (s *APIKeyRepoSuite) SetupTest() {
 	s.ctx = context.Background()
 	tx := testEntTx(s.T())
 	s.client = tx.Client()
-	s.repo = newAPIKeyRepositoryWithSQL(s.client, tx, nil)
+	s.repo = newAPIKeyRepositoryWithSQL(s.client, tx)
 }
 
 func TestAPIKeyRepoSuite(t *testing.T) {
@@ -84,6 +84,45 @@ func (s *APIKeyRepoSuite) TestGetByKey() {
 func (s *APIKeyRepoSuite) TestGetByKey_NotFound() {
 	_, err := s.repo.GetByKey(s.ctx, "non-existent-key")
 	s.Require().Error(err, "expected error for non-existent key")
+}
+
+func (s *APIKeyRepoSuite) TestGetByKeyForAuth_PreservesMessagesDispatchModelConfig() {
+	user := s.mustCreateUser("getbykey-auth-dispatch@test.com")
+	group, err := s.client.Group.Create().
+		SetName("g-auth-dispatch").
+		SetPlatform(service.PlatformOpenAI).
+		SetStatus(service.StatusActive).
+		SetSubscriptionType(service.SubscriptionTypeStandard).
+		SetRateMultiplier(1).
+		SetAllowMessagesDispatch(true).
+		SetDefaultMappedModel("gpt-5.4").
+		SetMessagesDispatchModelConfig(service.OpenAIMessagesDispatchModelConfig{
+			OpusMappedModel:   "gpt-5.4-nano",
+			SonnetMappedModel: "gpt-5.3-codex",
+			HaikuMappedModel:  "gpt-5.4-mini",
+			ExactModelMappings: map[string]string{
+				"claude-sonnet-4.5": "gpt-5.4-nano",
+			},
+		}).
+		Save(s.ctx)
+	s.Require().NoError(err)
+
+	key := &service.APIKey{
+		UserID:  user.ID,
+		Key:     "sk-getbykey-auth-dispatch",
+		Name:    "Dispatch Key",
+		GroupID: &group.ID,
+		Status:  service.StatusActive,
+	}
+	s.Require().NoError(s.repo.Create(s.ctx, key))
+
+	got, err := s.repo.GetByKeyForAuth(s.ctx, key.Key)
+	s.Require().NoError(err)
+	s.Require().NotNil(got.Group)
+	s.Require().True(got.Group.AllowMessagesDispatch)
+	s.Require().Equal("gpt-5.4", got.Group.DefaultMappedModel)
+	s.Require().Equal("gpt-5.4-nano", got.Group.MessagesDispatchModelConfig.OpusMappedModel)
+	s.Require().Equal("gpt-5.4-nano", got.Group.MessagesDispatchModelConfig.ExactModelMappings["claude-sonnet-4.5"])
 }
 
 // --- Update ---
