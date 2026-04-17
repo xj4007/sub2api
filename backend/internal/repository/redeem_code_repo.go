@@ -15,11 +15,24 @@ import (
 )
 
 type redeemCodeRepository struct {
-	client *dbent.Client
+	client       *dbent.Client
+	readerClient *dbent.Client
 }
 
-func NewRedeemCodeRepository(client *dbent.Client) service.RedeemCodeRepository {
-	return &redeemCodeRepository{client: client}
+func NewRedeemCodeRepository(client *dbent.Client, readerClient *ReaderEntClient) service.RedeemCodeRepository {
+	repo := &redeemCodeRepository{client: client}
+	if readerClient != nil {
+		repo.readerClient = readerClient.Client
+	}
+	return repo
+}
+
+func (r *redeemCodeRepository) readClient(ctx context.Context) *dbent.Client {
+	defaultClient := r.client
+	if r != nil && r.readerClient != nil {
+		defaultClient = r.readerClient
+	}
+	return clientFromContext(ctx, defaultClient)
 }
 
 func (r *redeemCodeRepository) Create(ctx context.Context, code *service.RedeemCode) error {
@@ -229,7 +242,7 @@ func (r *redeemCodeRepository) ListByUser(ctx context.Context, userID int64, lim
 		limit = 10
 	}
 
-	codes, err := r.client.RedeemCode.Query().
+	codes, err := r.readClient(ctx).RedeemCode.Query().
 		Where(redeemcode.UsedByEQ(userID)).
 		WithGroup().
 		Order(dbent.Desc(redeemcode.FieldUsedAt)).

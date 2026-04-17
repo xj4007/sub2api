@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 
 
-DEFAULT_IMAGE = "sub2api:ha-rw-pilot-20260410a"
+DEFAULT_IMAGE = "sub2api:ha-20260416b"
 
 
 def main() -> None:
@@ -85,7 +85,7 @@ def main() -> None:
         "UPDATE_PROXY_URL=",
         "REDIS_SENTINEL_ENABLED=true",
         "REDIS_SENTINEL_MASTER_NAME=sub2api-redis",
-        "REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379",
+        "REDIS_SENTINEL_ADDRS=10.77.0.1:26379,10.77.0.2:26379,10.77.0.3:26379,10.77.0.7:26379,10.77.0.8:26379",
         f"SUB2API_IMAGE={image}",
         "",
         "DATABASE_READER_HOST=pgproxy",

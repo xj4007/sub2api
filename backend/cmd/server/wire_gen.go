@@ -36,19 +36,25 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	if err != nil {
 		return nil, err
 	}
-	client, err := repository.ProvideEnt(configConfig)
+	entBundle, err := repository.ProvideEntBundle(configConfig)
 	if err != nil {
 		return nil, err
 	}
-	db, err := repository.ProvideSQLDB(client)
+	client, err := repository.ProvideEnt(entBundle)
 	if err != nil {
 		return nil, err
 	}
-	userRepository := repository.NewUserRepository(client, db)
-	redeemCodeRepository := repository.NewRedeemCodeRepository(client)
+	db, err := repository.ProvideSQLDB(entBundle)
+	if err != nil {
+		return nil, err
+	}
+	readerEnt := repository.ProvideReaderEnt(entBundle)
+	readerDB := repository.ProvideReaderSQLDB(entBundle)
+	userRepository := repository.NewUserRepository(client, db, readerEnt)
+	redeemCodeRepository := repository.NewRedeemCodeRepository(client, readerEnt)
 	redisClient := repository.ProvideRedis(configConfig)
 	refreshTokenCache := repository.NewRefreshTokenCache(redisClient)
-	settingRepository := repository.NewSettingRepository(client)
+	settingRepository := repository.NewSettingRepository(client, readerEnt)
 	groupRepository := repository.NewGroupRepository(client, db)
 	proxyRepository := repository.NewProxyRepository(client, db)
 	settingService := service.ProvideSettingService(settingRepository, groupRepository, proxyRepository, configConfig)
@@ -59,8 +65,8 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	emailQueueService := service.ProvideEmailQueueService(emailService)
 	promoCodeRepository := repository.NewPromoCodeRepository(client)
 	billingCache := repository.NewBillingCache(redisClient)
-	userSubscriptionRepository := repository.NewUserSubscriptionRepository(client)
-	apiKeyRepository := repository.NewAPIKeyRepository(client, db)
+	userSubscriptionRepository := repository.NewUserSubscriptionRepository(client, readerEnt)
+	apiKeyRepository := repository.NewAPIKeyRepository(client, db, readerEnt)
 	billingCacheService := service.NewBillingCacheService(billingCache, userRepository, userSubscriptionRepository, apiKeyRepository, configConfig)
 	userGroupRateRepository := repository.NewUserGroupRateRepository(db)
 	apiKeyCache := repository.NewAPIKeyCache(redisClient)
@@ -81,7 +87,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	authHandler := handler.NewAuthHandler(configConfig, authService, userService, settingService, promoService, redeemService, totpService)
 	userHandler := handler.NewUserHandler(userService, emailService, emailCache)
 	apiKeyHandler := handler.NewAPIKeyHandler(apiKeyService)
-	usageLogRepository := repository.NewUsageLogRepository(client, db)
+	usageLogRepository := repository.NewUsageLogRepository(client, db, readerEnt, readerDB)
 	usageService := service.NewUsageService(usageLogRepository, userRepository, client, apiKeyAuthCacheInvalidator)
 	usageHandler := handler.NewUsageHandler(usageService, apiKeyService)
 	redeemHandler := handler.NewRedeemHandler(redeemService)

@@ -41,7 +41,7 @@ func TestEntSoftDelete_ApiKey_DefaultFilterAndSkip(t *testing.T) {
 
 	u := createEntUser(t, ctx, client, uniqueSoftDeleteValue(t, "sd-user")+"@example.com")
 
-	repo := NewAPIKeyRepository(client, integrationDB)
+	repo := NewAPIKeyRepository(client, integrationDB, nil)
 	key := &service.APIKey{
 		UserID: u.ID,
 		Key:    uniqueSoftDeleteValue(t, "sk-soft-delete"),
@@ -73,7 +73,7 @@ func TestEntSoftDelete_ApiKey_DeleteIdempotent(t *testing.T) {
 
 	u := createEntUser(t, ctx, client, uniqueSoftDeleteValue(t, "sd-user2")+"@example.com")
 
-	repo := NewAPIKeyRepository(client, integrationDB)
+	repo := NewAPIKeyRepository(client, integrationDB, nil)
 	key := &service.APIKey{
 		UserID: u.ID,
 		Key:    uniqueSoftDeleteValue(t, "sk-soft-delete2"),
@@ -93,7 +93,7 @@ func TestEntSoftDelete_ApiKey_HardDeleteViaSkipSoftDelete(t *testing.T) {
 
 	u := createEntUser(t, ctx, client, uniqueSoftDeleteValue(t, "sd-user3")+"@example.com")
 
-	repo := NewAPIKeyRepository(client, integrationDB)
+	repo := NewAPIKeyRepository(client, integrationDB, nil)
 	key := &service.APIKey{
 		UserID: u.ID,
 		Key:    uniqueSoftDeleteValue(t, "sk-soft-delete3"),
@@ -134,7 +134,7 @@ func TestEntSoftDelete_UserSubscription_DefaultFilterAndSkip(t *testing.T) {
 	u := createEntUser(t, ctx, client, uniqueSoftDeleteValue(t, "sd-sub-user")+"@example.com")
 	g := createEntGroup(t, ctx, client, uniqueSoftDeleteValue(t, "sd-sub-group"))
 
-	repo := NewUserSubscriptionRepository(client)
+	repo := NewUserSubscriptionRepository(client, nil)
 	sub := &service.UserSubscription{
 		UserID:    u.ID,
 		GroupID:   g.ID,
@@ -166,7 +166,7 @@ func TestEntSoftDelete_UserSubscription_DeleteIdempotent(t *testing.T) {
 	u := createEntUser(t, ctx, client, uniqueSoftDeleteValue(t, "sd-sub-user2")+"@example.com")
 	g := createEntGroup(t, ctx, client, uniqueSoftDeleteValue(t, "sd-sub-group2"))
 
-	repo := NewUserSubscriptionRepository(client)
+	repo := NewUserSubscriptionRepository(client, nil)
 	sub := &service.UserSubscription{
 		UserID:    u.ID,
 		GroupID:   g.ID,
@@ -187,7 +187,7 @@ func TestEntSoftDelete_UserSubscription_ListExcludesDeleted(t *testing.T) {
 	g1 := createEntGroup(t, ctx, client, uniqueSoftDeleteValue(t, "sd-sub-group3a"))
 	g2 := createEntGroup(t, ctx, client, uniqueSoftDeleteValue(t, "sd-sub-group3b"))
 
-	repo := NewUserSubscriptionRepository(client)
+	repo := NewUserSubscriptionRepository(client, nil)
 
 	sub1 := &service.UserSubscription{
 		UserID:    u.ID,

@@ -25,7 +25,7 @@ func (s *UserSubscriptionRepoSuite) SetupTest() {
 	s.ctx = context.Background()
 	tx := testEntTx(s.T())
 	s.client = tx.Client()
-	s.repo = NewUserSubscriptionRepository(s.client).(*userSubscriptionRepository)
+	s.repo = NewUserSubscriptionRepository(s.client, nil).(*userSubscriptionRepository)
 }
 
 func TestUserSubscriptionRepoSuite(t *testing.T) {
@@ -727,7 +727,7 @@ func (s *UserSubscriptionRepoSuite) TestTxContext_RollbackIsolation() {
 		Save(txCtx)
 	s.Require().NoError(err, "create group in tx")
 
-	repo := NewUserSubscriptionRepository(baseClient)
+	repo := NewUserSubscriptionRepository(baseClient, nil)
 	sub := &service.UserSubscription{
 		UserID:     userEnt.ID,
 		GroupID:    groupEnt.ID,
