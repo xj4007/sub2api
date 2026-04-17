@@ -11,7 +11,8 @@ keys = json.loads(Path(sys.argv[2]).read_text())
 node_name = sys.argv[3]
 
 node = inventory["nodes"][node_name]
-listen_port = inventory["listen_port"]
+default_listen_port = inventory["listen_port"]
+listen_port = node.get("listen_port", default_listen_port)
 
 print("[Interface]")
 print(f"Address = {node['wg_ip']}/24")
@@ -22,9 +23,10 @@ print(f"PrivateKey = {keys[node_name]['private_key']}")
 for peer_name, peer in inventory["nodes"].items():
     if peer_name == node_name:
         continue
+    peer_listen_port = peer.get("listen_port", default_listen_port)
     print()
     print("[Peer]")
     print(f"PublicKey = {keys[peer_name]['public_key']}")
     print(f"AllowedIPs = {peer['wg_ip']}/32")
-    print(f"Endpoint = {peer['public_ip']}:{listen_port}")
+    print(f"Endpoint = {peer['public_ip']}:{peer_listen_port}")
     print("PersistentKeepalive = 25")
