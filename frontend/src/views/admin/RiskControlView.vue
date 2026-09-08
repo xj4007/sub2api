@@ -1856,7 +1856,7 @@ async function saveConfig() {
       mode: configForm.mode,
       base_url: configForm.base_url,
       model: configForm.model,
-      providers: configForm.providers.map(({ api_key_masked, ...provider }) => provider),
+      providers: configForm.providers.map(({ api_key_masked: _apiKeyMasked, ...provider }) => provider),
       // 后端语义：0 清除代理（直连），>0 指定代理
       proxy_id: configForm.proxy_id ?? 0,
       timeout_ms: Number(configForm.timeout_ms) || 3000,
