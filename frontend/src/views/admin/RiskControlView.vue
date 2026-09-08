@@ -378,6 +378,7 @@
             <button
               v-for="tab in settingsTabs"
               :key="tab.id"
+              :data-test="tab.id === 'providers' ? 'moderation-providers-tab' : undefined"
               type="button"
               class="inline-flex whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium transition-colors"
               :class="activeSettingsTab === tab.id ? 'bg-primary-50 text-primary-700 dark:bg-primary-900/30 dark:text-primary-300' : 'text-gray-500 hover:bg-gray-50 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-dark-700 dark:hover:text-white'"
@@ -700,6 +701,31 @@
             </div>
           </div>
 
+          <div v-else-if="activeSettingsTab === 'providers'" class="space-y-5">
+            <div class="rounded-lg border border-primary-100 bg-primary-50/50 p-4 text-sm text-gray-600 dark:border-primary-900/40 dark:bg-primary-900/10 dark:text-gray-300">
+              自定义审核 Provider 配置保存在 Redis，不新增数据库表或 migration。只有明确返回 allow=false 才会拦截。
+            </div>
+            <div v-for="(provider, index) in configForm.providers" :key="provider.id || index" class="rounded-lg border border-gray-100 p-4 dark:border-dark-700">
+              <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <input v-model.trim="provider.id" class="input" placeholder="Provider ID" />
+                <input v-model.trim="provider.base_url" class="input" placeholder="https://moderator.example 或 https://moderator.example/v1" />
+                <select v-model="provider.endpoint" class="input"><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option><option value="messages">Messages</option></select>
+                <input v-model.trim="provider.model" class="input" placeholder="moderation-model" />
+                <input v-model="provider.api_key" class="input" type="password" autocomplete="new-password" :placeholder="provider.api_key_masked || 'API Key（留空保留原密钥）'" />
+                <input v-model.number="provider.timeout_ms" class="input" type="number" min="500" max="30000" placeholder="Timeout ms" />
+                <input v-model.trim="provider.note" class="input" placeholder="备注（可选）" />
+                <label class="flex items-center gap-2 text-sm"><input v-model="provider.enabled" type="checkbox" /> 启用</label>
+              </div>
+              <button type="button" class="mt-3 text-sm text-red-600" @click="configForm.providers.splice(index, 1)">删除 Provider</button>
+              <button type="button" class="btn btn-secondary mt-3 ml-4 text-sm" :disabled="providerTestLoading[provider.id]" @click="testCustomProvider(provider)">
+                {{ providerTestLoading[provider.id] ? '测试中…' : '测试请求' }}
+              </button>
+              <span v-if="providerTestResult[provider.id]" class="ml-3 text-sm" :class="providerTestResult[provider.id].ok ? 'text-emerald-600' : 'text-red-600'">
+                {{ providerTestResult[provider.id].message }}
+              </span>
+            </div>
+            <button type="button" class="btn btn-secondary" @click="addProvider">新增 Provider</button>
+          </div>
           <div v-else-if="activeSettingsTab === 'scope'" class="space-y-5">
             <div class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
               <div>
@@ -1148,7 +1174,7 @@ import { useAppStore } from '@/stores/app'
 import { extractApiErrorMessage } from '@/utils/apiError'
 import { formatDateTime as formatDateTimeValue } from '@/utils/format'
 
-type SettingsTab = 'basic' | 'scope' | 'runtime' | 'response' | 'riskThresholds' | 'retention' | 'keywords'
+type SettingsTab = 'basic' | 'providers' | 'scope' | 'runtime' | 'response' | 'riskThresholds' | 'retention' | 'keywords'
 type WorkerSlotState = 'active' | 'idle' | 'disabled'
 type APIKeysWriteMode = 'append' | 'replace'
 type OverviewIcon = 'shield' | 'key' | 'users' | 'document'
@@ -1220,6 +1246,8 @@ const apiKeyRowsExpanded = ref<boolean>(false)
 const moderationTestPrompt = ref('')
 const moderationTestImages = ref<string[]>([])
 const moderationTestResult = ref<ContentModerationTestAuditResult | null>(null)
+const providerTestLoading = reactive<Record<string, boolean>>({})
+const providerTestResult = reactive<Record<string, { ok: boolean; message: string }>>({})
 const inputDetailRow = ref<ContentModerationLog | null>(null)
 let statusTimer: number | null = null
 
@@ -1260,6 +1288,7 @@ const configForm = reactive({
   keyword_blocking_mode: 'keyword_and_api' as KeywordBlockingMode,
   model_filter_type: 'all' as ContentModerationModelFilterType,
   model_filter_models: [] as string[],
+  providers: [] as Array<{ id: string; base_url: string; endpoint: 'chat_completions' | 'responses' | 'messages'; model: string; priority: number; enabled: boolean; timeout_ms: number; note: string; api_key: string; api_key_masked: string }>,
 })
 
 const pagination = reactive({
@@ -1280,6 +1309,7 @@ const filters = reactive({
 
 const settingsTabs = computed<Array<{ id: SettingsTab; label: string }>>(() => [
   { id: 'basic', label: t('admin.riskControl.tabs.basic') },
+  { id: 'providers', label: '自定义审核 Provider' },
   { id: 'scope', label: t('admin.riskControl.tabs.scope') },
   { id: 'runtime', label: t('admin.riskControl.tabs.runtime') },
   { id: 'response', label: t('admin.riskControl.tabs.response') },
@@ -1703,6 +1733,7 @@ function applyConfig(config: ContentModerationConfig) {
   configForm.mode = config.mode
   configForm.base_url = config.base_url || 'https://api.openai.com'
   configForm.model = config.model || 'omni-moderation-latest'
+  configForm.providers = (config.providers || []).map((provider) => ({ ...provider, api_key: '', note: provider.note || '' }))
   configForm.proxy_id = config.proxy_id || null
   configForm.api_keys_text = ''
   configForm.api_key_configured = config.api_key_configured
@@ -1739,6 +1770,33 @@ function applyConfig(config: ContentModerationConfig) {
   const modelFilter = normalizeModelFilter(config.model_filter)
   configForm.model_filter_type = modelFilter.type
   configForm.model_filter_models = modelFilter.models
+}
+
+function addProvider() {
+  configForm.providers.push({ id: `provider-${configForm.providers.length + 1}`, base_url: '', endpoint: 'chat_completions', model: '', priority: configForm.providers.length + 1, enabled: false, timeout_ms: 3000, note: '', api_key: '', api_key_masked: '' })
+}
+
+async function testCustomProvider(provider: typeof configForm.providers[number]) {
+  const id = provider.id.trim()
+  if (!id) {
+    appStore.showError('请先填写 Provider ID')
+    return
+  }
+  providerTestLoading[id] = true
+  try {
+    const result = await adminAPI.riskControl.testProvider({
+      provider_id: id,
+      api_key: provider.api_key,
+      prompt: 'This is a provider connectivity test. Return allow=true as JSON.',
+    })
+    providerTestResult[id] = { ok: true, message: result.allow ? '请求成功：Provider 返回 allow=true' : '请求成功：Provider 返回 allow=false' }
+    appStore.showSuccess('Provider 测试请求成功')
+  } catch (err: unknown) {
+    providerTestResult[id] = { ok: false, message: extractApiErrorMessage(err, 'Provider 请求失败，已按策略处理') }
+    appStore.showError(providerTestResult[id].message)
+  } finally {
+    providerTestLoading[id] = false
+  }
 }
 
 async function loadAll() {
@@ -1798,6 +1856,7 @@ async function saveConfig() {
       mode: configForm.mode,
       base_url: configForm.base_url,
       model: configForm.model,
+      providers: configForm.providers.map(({ api_key_masked, ...provider }) => provider),
       // 后端语义：0 清除代理（直连），>0 指定代理
       proxy_id: configForm.proxy_id ?? 0,
       timeout_ms: Number(configForm.timeout_ms) || 3000,

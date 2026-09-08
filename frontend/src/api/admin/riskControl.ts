@@ -3,6 +3,28 @@ import { apiClient } from '../client'
 export type ModerationMode = 'off' | 'observe' | 'pre_block'
 export type KeywordBlockingMode = 'keyword_only' | 'keyword_and_api' | 'api_only'
 export type ContentModerationModelFilterType = 'all' | 'include' | 'exclude'
+export type ModerationProviderEndpoint = 'chat_completions' | 'responses' | 'messages'
+
+export interface ContentModerationProvider {
+  id: string
+  base_url: string
+  endpoint: ModerationProviderEndpoint
+  model: string
+  priority: number
+  enabled: boolean
+  timeout_ms: number
+  note?: string
+  api_key_configured: boolean
+  api_key_masked: string
+}
+
+export interface TestModerationProviderResponse {
+  provider_id: string
+  allow: boolean
+  flagged: boolean
+  reason?: string
+  categories?: Record<string, number>
+}
 
 export interface ContentModerationModelFilter {
   type: ContentModerationModelFilterType
@@ -14,6 +36,7 @@ export interface ContentModerationConfig {
   mode: ModerationMode
   base_url: string
   model: string
+  providers: ContentModerationProvider[]
   proxy_id: number | null
   api_key_configured: boolean
   api_key_masked: string
@@ -93,6 +116,17 @@ export interface UpdateContentModerationConfig {
   mode?: ModerationMode
   base_url?: string
   model?: string
+  providers?: Array<{
+    id: string
+    base_url: string
+    endpoint: ModerationProviderEndpoint
+    model: string
+    priority: number
+    enabled: boolean
+    timeout_ms: number
+    note?: string
+    api_key?: string
+  }>
   // undefined 不修改；0 清除（直连）；>0 指定代理
   proxy_id?: number
   api_key?: string
@@ -258,6 +292,15 @@ export async function testAPIKeys(
   return data
 }
 
+export async function testProvider(payload: {
+  provider_id: string
+  api_key?: string
+  prompt?: string
+}): Promise<TestModerationProviderResponse> {
+  const { data } = await apiClient.post<TestModerationProviderResponse>('/admin/risk-control/providers/test', payload)
+  return data
+}
+
 export async function listLogs(
   params: ListContentModerationLogsParams = {}
 ): Promise<ContentModerationLogsResponse> {
@@ -291,6 +334,7 @@ export const riskControlAPI = {
   updateConfig,
   getStatus,
   testAPIKeys,
+  testProvider,
   listLogs,
   unbanUser,
   deleteFlaggedHash,

@@ -143,6 +143,8 @@ type ContentModerationConfig struct {
 	Mode    string `json:"mode"`
 	BaseURL string `json:"base_url"`
 	Model   string `json:"model"`
+	// Providers is optional. When empty, the legacy /v1/moderations API-key pool remains active.
+	Providers []ModerationProviderConfig `json:"providers,omitempty"`
 	// ProxyID 指定审计请求使用的代理服务器（IP管理-代理服务器），nil 表示直连。
 	ProxyID              *int64                       `json:"proxy_id,omitempty"`
 	APIKey               string                       `json:"api_key,omitempty"`
@@ -179,6 +181,7 @@ type ContentModerationConfigView struct {
 	Mode                           string                          `json:"mode"`
 	BaseURL                        string                          `json:"base_url"`
 	Model                          string                          `json:"model"`
+	Providers                      []ContentModerationProviderView `json:"providers"`
 	ProxyID                        *int64                          `json:"proxy_id"`
 	APIKeyConfigured               bool                            `json:"api_key_configured"`
 	APIKeyMasked                   string                          `json:"api_key_masked"`
@@ -266,10 +269,11 @@ type ContentModerationTestAuditResult struct {
 }
 
 type UpdateContentModerationConfigInput struct {
-	Enabled *bool   `json:"enabled"`
-	Mode    *string `json:"mode"`
-	BaseURL *string `json:"base_url"`
-	Model   *string `json:"model"`
+	Enabled   *bool                       `json:"enabled"`
+	Mode      *string                     `json:"mode"`
+	BaseURL   *string                     `json:"base_url"`
+	Model     *string                     `json:"model"`
+	Providers *[]ModerationProviderConfig `json:"providers"`
 	// ProxyID nil 表示不修改；<=0 表示清除代理（恢复直连）；>0 表示指定代理。
 	ProxyID                        *int64                        `json:"proxy_id"`
 	APIKey                         *string                       `json:"api_key"`
@@ -497,6 +501,11 @@ type ContentModerationHashCache interface {
 	CountFlaggedInputHashes(ctx context.Context) (int64, error)
 }
 
+type ContentModerationConfigStore interface {
+	Get(ctx context.Context) (string, bool, error)
+	Set(ctx context.Context, value string) error
+}
+
 type ContentModerationService struct {
 	settingRepo              SettingRepository
 	repo                     ContentModerationRepository
@@ -507,10 +516,12 @@ type ContentModerationService struct {
 	authCacheInvalidator     APIKeyAuthCacheInvalidator
 	emailService             *EmailService
 	httpClient               *http.Client
+	configStore              ContentModerationConfigStore
 	moderationProxyCache     atomic.Pointer[moderationProxyURLCacheEntry]
 	asyncQueue               chan contentModerationTask
 	workerCount              int
 	apiKeyCursor             atomic.Uint64
+	customProviderCursor     atomic.Uint64
 	asyncActive              atomic.Int64
 	asyncEnqueued            atomic.Int64
 	asyncDropped             atomic.Int64
@@ -603,6 +614,16 @@ func NewContentModerationService(
 	return svc
 }
 
+func NewContentModerationServiceWithRedis(
+	settingRepo SettingRepository, repo ContentModerationRepository, hashCache ContentModerationHashCache,
+	groupRepo GroupRepository, userRepo UserRepository, proxyRepo ProxyRepository,
+	authCacheInvalidator APIKeyAuthCacheInvalidator, emailService *EmailService, configStore ContentModerationConfigStore,
+) *ContentModerationService {
+	svc := NewContentModerationService(settingRepo, repo, hashCache, groupRepo, userRepo, proxyRepo, authCacheInvalidator, emailService)
+	svc.configStore = configStore
+	return svc
+}
+
 func (s *ContentModerationService) GetConfig(ctx context.Context) (*ContentModerationConfigView, error) {
 	cfg, err := s.loadConfig(ctx)
 	if err != nil {
@@ -627,6 +648,24 @@ func (s *ContentModerationService) UpdateConfig(ctx context.Context, input Updat
 	}
 	if input.Model != nil {
 		cfg.Model = strings.TrimSpace(*input.Model)
+	}
+	if input.Providers != nil {
+		providers := append([]ModerationProviderConfig(nil), (*input.Providers)...)
+		for index := range providers {
+			if strings.TrimSpace(providers[index].APIKey) == "" {
+				for _, existing := range cfg.Providers {
+					if existing.ID == providers[index].ID {
+						providers[index].APIKey = existing.APIKey
+						break
+					}
+				}
+			}
+		}
+		normalized, err := normalizeModerationProviders(providers)
+		if err != nil {
+			return nil, infraerrors.BadRequest("INVALID_CONTENT_MODERATION_PROVIDERS", err.Error())
+		}
+		cfg.Providers = normalized
 	}
 	if input.ProxyID != nil {
 		if *input.ProxyID > 0 {
@@ -732,7 +771,7 @@ func (s *ContentModerationService) UpdateConfig(ctx context.Context, input Updat
 	if err != nil {
 		return nil, fmt.Errorf("marshal content moderation config: %w", err)
 	}
-	if err := s.settingRepo.Set(ctx, SettingKeyContentModerationConfig, string(raw)); err != nil {
+	if err := s.saveModerationConfig(ctx, string(raw)); err != nil {
 		return nil, fmt.Errorf("save content moderation config: %w", err)
 	}
 	s.replaceRuntimeConfig(cfg, raw)
@@ -1017,7 +1056,7 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 			"sample_rate", cfg.SampleRate)
 		return allow, nil
 	}
-	if len(cfg.apiKeys()) == 0 {
+	if len(cfg.Providers) == 0 && len(cfg.apiKeys()) == 0 {
 		if cfg.Mode == ContentModerationModePreBlock {
 			s.recordPreBlockSyncMetric(0, ContentModerationActionError)
 		}
@@ -1074,6 +1113,7 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 		}
 		if cfg.RecordNonHits {
 			log := s.buildLog(input, cfg, ContentModerationActionError, false, "", 0, nil, content.ExcerptText(), &latency, queueDelay, err.Error())
+
 			_ = s.repo.CreateLog(ctx, log)
 		}
 		return allow
@@ -1107,6 +1147,7 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 		"queue_delay_ms", queueDelay)
 	if flagged || cfg.RecordNonHits {
 		log := s.buildLog(input, cfg, action, flagged, highestCategory, highestScore, result.CategoryScores, content.ExcerptText(), &latency, queueDelay, "")
+
 		if queueDelay == nil && cfg.Mode == ContentModerationModePreBlock {
 			s.enqueueRecord(input, cfg, log, hashText, flagged, flagged)
 		} else {
@@ -1257,7 +1298,7 @@ func (s *ContentModerationService) worker(id int) {
 				s.asyncProcessed.Add(1)
 				return
 			}
-			if !cfg.Enabled || cfg.Mode == ContentModerationModeOff || len(cfg.apiKeys()) == 0 {
+			if !cfg.Enabled || cfg.Mode == ContentModerationModeOff || (len(cfg.Providers) == 0 && len(cfg.apiKeys()) == 0) {
 				return
 			}
 			if !cfg.includesGroup(task.input.GroupID) {
@@ -1486,7 +1527,7 @@ func (s *ContentModerationService) runCleanupOnce() {
 }
 
 func (s *ContentModerationService) loadConfig(ctx context.Context) (*ContentModerationConfig, error) {
-	raw, err := s.settingRepo.GetValue(ctx, SettingKeyContentModerationConfig)
+	raw, err := s.loadModerationConfigRaw(ctx)
 	if err != nil {
 		if errors.Is(err, ErrSettingNotFound) {
 			return parseContentModerationConfig("")
@@ -1494,6 +1535,26 @@ func (s *ContentModerationService) loadConfig(ctx context.Context) (*ContentMode
 		return nil, fmt.Errorf("get content moderation config: %w", err)
 	}
 	return parseContentModerationConfig(raw)
+}
+
+func (s *ContentModerationService) loadModerationConfigRaw(ctx context.Context) (string, error) {
+	if s != nil && s.configStore != nil {
+		raw, found, err := s.configStore.Get(ctx)
+		if err != nil {
+			return "", err
+		}
+		if found {
+			return raw, nil
+		}
+	}
+	return s.settingRepo.GetValue(ctx, SettingKeyContentModerationConfig)
+}
+
+func (s *ContentModerationService) saveModerationConfig(ctx context.Context, raw string) error {
+	if s != nil && s.configStore != nil {
+		return s.configStore.Set(ctx, raw)
+	}
+	return s.settingRepo.Set(ctx, SettingKeyContentModerationConfig, raw)
 }
 
 func parseContentModerationConfig(raw string) (*ContentModerationConfig, error) {
@@ -1572,6 +1633,11 @@ func (s *ContentModerationService) refreshRuntimeSnapshot(ctx context.Context) (
 		return nil, fmt.Errorf("get content moderation runtime settings: %w", err)
 	}
 	rawConfig := values[SettingKeyContentModerationConfig]
+	if s.configStore != nil {
+		if redisRaw, found, redisErr := s.configStore.Get(ctx); redisErr == nil && found {
+			rawConfig = redisRaw
+		}
+	}
 	configDigest := sha256.Sum256([]byte(rawConfig))
 	if current := s.runtimeSnapshot.Load(); current != nil && current.configDigest == configDigest {
 		snapshot := &contentModerationRuntimeSnapshot{
@@ -1661,6 +1727,9 @@ func (s *ContentModerationService) validateConfig(ctx context.Context, cfg *Cont
 	if _, err := url.ParseRequestURI(cfg.BaseURL); err != nil {
 		return infraerrors.BadRequest("INVALID_CONTENT_MODERATION_BASE_URL", "OpenAI Base URL 无效")
 	}
+	if _, err := normalizeModerationProviders(cfg.Providers); err != nil {
+		return infraerrors.BadRequest("INVALID_CONTENT_MODERATION_PROVIDERS", err.Error())
+	}
 	if cfg.ProxyID != nil && s.proxyRepo != nil {
 		if _, err := s.proxyRepo.GetByID(ctx, *cfg.ProxyID); err != nil {
 			return infraerrors.BadRequest("INVALID_CONTENT_MODERATION_PROXY", fmt.Sprintf("代理服务器不存在: %d", *cfg.ProxyID))
@@ -1683,6 +1752,10 @@ func (s *ContentModerationService) validateConfig(ctx context.Context, cfg *Cont
 }
 
 func (s *ContentModerationService) callModeration(ctx context.Context, cfg *ContentModerationConfig, input any, trackKeyLoad ...bool) (*moderationAPIResult, error) {
+	if len(cfg.Providers) > 0 {
+		return s.callCustomModerationProviders(ctx, cfg, input)
+	}
+
 	attempts := cfg.RetryCount + 1
 	if attempts <= 0 {
 		attempts = 1
@@ -2117,6 +2190,7 @@ func cloneContentModerationConfig(cfg *ContentModerationConfig) *ContentModerati
 	clone := *cfg
 	clone.ProxyID = cloneInt64Ptr(cfg.ProxyID)
 	clone.APIKeys = append([]string(nil), cfg.APIKeys...)
+	clone.Providers = append([]ModerationProviderConfig(nil), cfg.Providers...)
 	clone.GroupIDs = append([]int64(nil), cfg.GroupIDs...)
 	clone.BlockedKeywords = append([]string(nil), cfg.BlockedKeywords...)
 	clone.Thresholds = cloneFloatMap(cfg.Thresholds)
@@ -2145,6 +2219,7 @@ func (cfg *ContentModerationConfig) normalize() {
 		cfg.Model = defaultContentModerationModel
 	}
 	cfg.Model = strings.TrimSpace(cfg.Model)
+
 	if cfg.ProxyID != nil && *cfg.ProxyID <= 0 {
 		cfg.ProxyID = nil
 	}
@@ -2406,11 +2481,16 @@ func (s *ContentModerationService) configView(cfg *ContentModerationConfig) *Con
 	if len(masks) > 0 {
 		apiKeyMasked = masks[0]
 	}
+	providers := make([]ContentModerationProviderView, 0, len(cfg.Providers))
+	for _, provider := range cfg.Providers {
+		providers = append(providers, ContentModerationProviderView{ID: provider.ID, BaseURL: provider.BaseURL, Endpoint: provider.Endpoint, Model: provider.Model, Priority: provider.Priority, Enabled: provider.Enabled, TimeoutMS: provider.TimeoutMS, Note: provider.Note, APIKeyConfigured: strings.TrimSpace(provider.APIKey) != "", APIKeyMasked: maskSecretTail(provider.APIKey)})
+	}
 	return &ContentModerationConfigView{
 		Enabled:                        cfg.Enabled,
 		Mode:                           cfg.Mode,
 		BaseURL:                        cfg.BaseURL,
 		Model:                          cfg.Model,
+		Providers:                      providers,
 		ProxyID:                        cloneInt64Ptr(cfg.ProxyID),
 		APIKeyConfigured:               len(keys) > 0,
 		APIKeyMasked:                   apiKeyMasked,
@@ -2679,6 +2759,7 @@ type moderationAPIResponse struct {
 type moderationAPIResult struct {
 	Flagged        bool               `json:"flagged"`
 	CategoryScores map[string]float64 `json:"category_scores"`
+	ProviderID     string             `json:"provider_id,omitempty"`
 }
 
 func evaluateModerationScores(scores map[string]float64, thresholds map[string]float64) (bool, string, float64) {

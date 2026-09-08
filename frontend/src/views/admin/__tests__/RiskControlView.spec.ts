@@ -78,6 +78,7 @@ const baseConfig = (): ContentModerationConfig => ({
   mode: 'pre_block',
   base_url: 'https://api.openai.com',
   model: 'omni-moderation-latest',
+  providers: [],
   proxy_id: null,
   api_key_configured: false,
   api_key_masked: '',
@@ -283,6 +284,52 @@ describe('admin RiskControlView', () => {
       }),
     }))
     expect(showError).not.toHaveBeenCalled()
+  })
+
+  it('shows and saves custom moderation providers without exposing stored API keys', async () => {
+    const config = baseConfig() as ContentModerationConfig & { providers: Array<Record<string, unknown>> }
+    config.providers = [{
+      id: 'safety-primary',
+      base_url: 'https://moderator.example',
+      endpoint: 'chat_completions',
+      model: 'moderator-model',
+      priority: 10,
+      enabled: true,
+      timeout_ms: 2500,
+      note: 'primary safety endpoint',
+      api_key_configured: true,
+      api_key_masked: 'sk-***last4',
+    }]
+    getConfig.mockResolvedValue(config)
+
+    const wrapper = mount(RiskControlView, {
+      global: {
+        stubs: {
+          AppLayout: AppLayoutStub,
+          BaseDialog: BaseDialogStub,
+          Icon: true,
+          Select: true,
+          Toggle: true,
+          Pagination: true,
+          ModelWhitelistSelector: ModelWhitelistSelectorStub,
+          ProxySelector: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    await findButtonByText(wrapper, 'admin.riskControl.openSettings').trigger('click')
+    await wrapper.get('[data-test="moderation-providers-tab"]').trigger('click')
+    expect(wrapper.text()).toContain('自定义审核 Provider 配置保存在 Redis')
+    await findButtonByText(wrapper, '新增 Provider').trigger('click')
+    await wrapper.get('input[placeholder="Provider ID"]').setValue('safety-primary')
+    expect(wrapper.text()).not.toContain('provider-canary-secret')
+
+    await findButtonByText(wrapper, 'admin.riskControl.saveConfig').trigger('click')
+    await flushPromises()
+    expect(updateConfig).toHaveBeenCalledWith(expect.objectContaining({
+      providers: expect.arrayContaining([expect.objectContaining({ id: 'safety-primary', api_key: '' })]),
+    }))
   })
 
   it('describes worker runtime as async audit and pre-block record processing', async () => {

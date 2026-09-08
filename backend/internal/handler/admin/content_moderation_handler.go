@@ -20,10 +20,11 @@ func NewContentModerationHandler(svc *service.ContentModerationService) *Content
 }
 
 type contentModerationConfigRequest struct {
-	Enabled *bool   `json:"enabled"`
-	Mode    *string `json:"mode"`
-	BaseURL *string `json:"base_url"`
-	Model   *string `json:"model"`
+	Enabled   *bool                               `json:"enabled"`
+	Mode      *string                             `json:"mode"`
+	BaseURL   *string                             `json:"base_url"`
+	Model     *string                             `json:"model"`
+	Providers *[]service.ModerationProviderConfig `json:"providers"`
 	// 审计请求使用的代理服务器：null 不修改；0 清除（直连）；>0 指定代理。
 	ProxyID              *int64              `json:"proxy_id"`
 	APIKey               *string             `json:"api_key"`
@@ -67,6 +68,12 @@ type contentModerationAPIKeyTestRequest struct {
 	Images    []string `json:"images"`
 }
 
+type contentModerationProviderTestRequest struct {
+	ProviderID string `json:"provider_id" binding:"required"`
+	APIKey     string `json:"api_key"`
+	Prompt     string `json:"prompt"`
+}
+
 type contentModerationHashRequest struct {
 	InputHash string `json:"input_hash"`
 }
@@ -91,6 +98,7 @@ func (h *ContentModerationHandler) UpdateConfig(c *gin.Context) {
 		Mode:                           req.Mode,
 		BaseURL:                        req.BaseURL,
 		Model:                          req.Model,
+		Providers:                      req.Providers,
 		ProxyID:                        req.ProxyID,
 		APIKey:                         req.APIKey,
 		APIKeys:                        req.APIKeys,
@@ -141,6 +149,24 @@ func (h *ContentModerationHandler) TestAPIKeys(c *gin.Context) {
 		ProxyID:   req.ProxyID,
 		Prompt:    req.Prompt,
 		Images:    req.Images,
+	})
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *ContentModerationHandler) TestProvider(c *gin.Context) {
+	var req contentModerationProviderTestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	result, err := h.service.TestCustomModerationProvider(c.Request.Context(), service.TestModerationProviderInput{
+		ProviderID: req.ProviderID,
+		APIKey:     req.APIKey,
+		Prompt:     req.Prompt,
 	})
 	if err != nil {
 		response.ErrorFrom(c, err)
