@@ -63,6 +63,7 @@ type TestModerationProviderInput struct {
 	ProviderID string
 	APIKey     string
 	Prompt     string
+	Provider   *ModerationProviderConfig
 }
 
 type TestModerationProviderResult struct {
@@ -92,6 +93,28 @@ func (e *moderationProviderError) Unwrap() error {
 	return e.Err
 }
 
+type moderationProviderHTTPError struct {
+	StatusCode int
+}
+
+func (e *moderationProviderHTTPError) Error() string {
+	if e == nil {
+		return "moderation provider HTTP error"
+	}
+	return fmt.Sprintf("moderation provider status %d", e.StatusCode)
+}
+
+type moderationProviderResponseError struct {
+	reason string
+}
+
+func (e *moderationProviderResponseError) Error() string {
+	if e == nil || e.reason == "" {
+		return "moderation provider response invalid"
+	}
+	return "moderation provider response invalid: " + e.reason
+}
+
 func NormalizeModerationEndpoint(endpoint string) (string, error) {
 	switch strings.TrimSpace(endpoint) {
 	case ModerationEndpointChatCompletions, ModerationEndpointResponses, ModerationEndpointMessages:
@@ -119,6 +142,9 @@ func normalizeModerationProviders(providers []ModerationProviderConfig) ([]Moder
 		}
 		seen[provider.ID] = struct{}{}
 		provider.BaseURL = normalizeModerationBaseURL(provider.BaseURL)
+		if strings.HasSuffix(strings.ToLower(strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")), "/v1/completions") {
+			return nil, fmt.Errorf("provider %q: legacy /v1/completions is unsupported; use chat_completions with /v1/chat/completions", provider.ID)
+		}
 		provider.Model = strings.TrimSpace(provider.Model)
 		provider.APIKey = strings.TrimSpace(provider.APIKey)
 		provider.Note = strings.TrimSpace(provider.Note)
@@ -143,10 +169,28 @@ func normalizeModerationProviders(providers []ModerationProviderConfig) ([]Moder
 
 func normalizeModerationBaseURL(raw string) string {
 	base := strings.TrimRight(strings.TrimSpace(raw), "/")
-	if strings.HasSuffix(strings.ToLower(base), "/v1") {
+	lower := strings.ToLower(base)
+	for _, suffix := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+		if strings.HasSuffix(lower, suffix) {
+			return strings.TrimRight(base[:len(base)-len(suffix)], "/")
+		}
+	}
+	if strings.HasSuffix(lower, "/v1") {
 		base = strings.TrimRight(base[:len(base)-len("/v1")], "/")
 	}
 	return base
+}
+
+func moderationProviderConfigsEqual(left, right ModerationProviderConfig) bool {
+	return strings.TrimSpace(left.ID) == strings.TrimSpace(right.ID) &&
+		normalizeModerationBaseURL(left.BaseURL) == normalizeModerationBaseURL(right.BaseURL) &&
+		strings.TrimSpace(left.Endpoint) == strings.TrimSpace(right.Endpoint) &&
+		strings.TrimSpace(left.Model) == strings.TrimSpace(right.Model) &&
+		strings.TrimSpace(left.APIKey) == strings.TrimSpace(right.APIKey) &&
+		left.Priority == right.Priority &&
+		left.Enabled == right.Enabled &&
+		left.TimeoutMS == right.TimeoutMS &&
+		strings.TrimSpace(left.Note) == strings.TrimSpace(right.Note)
 }
 
 func ParseModerationProviderConfig(raw []byte) ([]ModerationProviderConfig, error) {
@@ -225,7 +269,7 @@ func (s *ContentModerationService) callCustomModerationProviders(ctx context.Con
 				err = callErr
 				if err == nil {
 					cancel()
-					return &moderationAPIResult{Flagged: decision.Flagged || !decision.Allowed, CategoryScores: decision.Categories, ProviderID: provider.ID}, nil
+					return &moderationAPIResult{Flagged: decision.Flagged || !decision.Allowed, ExplicitFlagged: !decision.Allowed, CategoryScores: decision.Categories, ProviderID: provider.ID}, nil
 				}
 			}
 		}
@@ -248,44 +292,74 @@ func (s *ContentModerationService) TestCustomModerationProvider(ctx context.Cont
 	if err != nil {
 		return nil, err
 	}
-	for _, provider := range cfg.Providers {
-		if provider.ID != strings.TrimSpace(input.ProviderID) {
+	providerID := strings.TrimSpace(input.ProviderID)
+	var provider ModerationProviderConfig
+	var savedProvider ModerationProviderConfig
+	found := false
+	for _, saved := range cfg.Providers {
+		if saved.ID != providerID {
 			continue
 		}
-		if strings.TrimSpace(input.APIKey) != "" {
-			provider.APIKey = strings.TrimSpace(input.APIKey)
-		}
-		if provider.APIKey == "" {
-			return nil, infraerrors.BadRequest("CONTENT_MODERATION_PROVIDER_API_KEY_MISSING", "Provider 未配置 API Key")
-		}
-		prompt := strings.TrimSpace(input.Prompt)
-		if prompt == "" {
-			prompt = "This is a provider connectivity test. Return allow=true as JSON."
-		}
-		timeoutMS := provider.TimeoutMS
-		if timeoutMS <= 0 {
-			timeoutMS = cfg.TimeoutMS
-		}
-		testCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
-		client, callErr := s.moderationHTTPClient(testCtx, cfg)
-		if callErr == nil {
-			var decision ModerationDecision
-			decision, callErr = ModerateWithProvider(testCtx, client, provider, prompt)
-			if callErr == nil {
-				cancel()
-				return &TestModerationProviderResult{ProviderID: provider.ID, Allowed: decision.Allowed, Flagged: decision.Flagged, Reason: decision.Reason, Categories: decision.Categories}, nil
-			}
-		}
-		cancel()
-		if !isModerationProviderTimeout(callErr) {
-			s.disableModerationProvider(ctx, cfg, provider.ID)
-		}
-		if isModerationProviderTimeout(callErr) {
-			return nil, infraerrors.GatewayTimeout("CONTENT_MODERATION_PROVIDER_TIMEOUT", "Provider 请求超时")
-		}
-		return nil, infraerrors.New(http.StatusBadGateway, "CONTENT_MODERATION_PROVIDER_REQUEST_FAILED", "Provider 请求失败，请检查 URL、协议、模型和 API Key")
+		provider = saved
+		savedProvider = saved
+		found = true
+		break
 	}
-	return nil, infraerrors.NotFound("CONTENT_MODERATION_PROVIDER_NOT_FOUND", fmt.Sprintf("Provider %q 不存在", input.ProviderID))
+	if input.Provider != nil {
+		provider = *input.Provider
+		provider.ID = strings.TrimSpace(provider.ID)
+		if provider.ID == "" {
+			provider.ID = providerID
+		}
+		if provider.ID != providerID {
+			return nil, infraerrors.BadRequest("INVALID_CONTENT_MODERATION_PROVIDER", "Provider ID 与测试配置不一致")
+		}
+		if strings.TrimSpace(provider.APIKey) == "" && found {
+			provider.APIKey = savedProvider.APIKey
+		}
+	} else if !found {
+		return nil, infraerrors.NotFound("CONTENT_MODERATION_PROVIDER_NOT_FOUND", fmt.Sprintf("Provider %q 不存在", input.ProviderID))
+	}
+	if strings.TrimSpace(input.APIKey) != "" {
+		provider.APIKey = strings.TrimSpace(input.APIKey)
+	}
+	usesSavedProvider := found && moderationProviderConfigsEqual(provider, savedProvider)
+	if strings.TrimSpace(provider.APIKey) == "" {
+		return nil, infraerrors.BadRequest("CONTENT_MODERATION_PROVIDER_API_KEY_MISSING", "Provider 未配置 API Key")
+	}
+	provider.Enabled = true
+	normalized, err := normalizeModerationProviders([]ModerationProviderConfig{provider})
+	if err != nil {
+		return nil, infraerrors.BadRequest("INVALID_CONTENT_MODERATION_PROVIDER", err.Error())
+	}
+	provider = normalized[0]
+
+	prompt := strings.TrimSpace(input.Prompt)
+	if prompt == "" {
+		prompt = "This is a provider connectivity test. Return allow=true as JSON."
+	}
+	timeoutMS := provider.TimeoutMS
+	if timeoutMS <= 0 {
+		timeoutMS = cfg.TimeoutMS
+	}
+	testCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	client, callErr := s.moderationHTTPClient(testCtx, cfg)
+	if callErr == nil {
+		var decision ModerationDecision
+		decision, callErr = ModerateWithProvider(testCtx, client, provider, prompt)
+		if callErr == nil {
+			cancel()
+			return &TestModerationProviderResult{ProviderID: provider.ID, Allowed: decision.Allowed, Flagged: decision.Flagged, Reason: decision.Reason, Categories: decision.Categories}, nil
+		}
+	}
+	cancel()
+	if usesSavedProvider && !isModerationProviderTimeout(callErr) {
+		s.disableModerationProvider(ctx, cfg, provider.ID)
+	}
+	if isModerationProviderTimeout(callErr) {
+		return nil, infraerrors.GatewayTimeout("CONTENT_MODERATION_PROVIDER_TIMEOUT", "Provider 请求超时")
+	}
+	return nil, infraerrors.New(http.StatusBadGateway, "CONTENT_MODERATION_PROVIDER_REQUEST_FAILED", moderationProviderTestFailureMessage(callErr))
 }
 
 // disableModerationProvider persists a non-timeout provider failure. Timeout
@@ -310,6 +384,25 @@ func (s *ContentModerationService) disableModerationProvider(ctx context.Context
 		return
 	}
 	s.replaceRuntimeConfig(next, raw)
+}
+
+func moderationProviderTestFailureMessage(err error) string {
+	var httpErr *moderationProviderHTTPError
+	if errors.As(err, &httpErr) {
+		switch httpErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return "Provider API Key 无效或无权限"
+		case http.StatusNotFound:
+			return "Provider 返回 404，请检查 Base URL、Endpoint 和 Model"
+		default:
+			return fmt.Sprintf("Provider 返回上游 HTTP %d", httpErr.StatusCode)
+		}
+	}
+	var responseErr *moderationProviderResponseError
+	if errors.As(err, &responseErr) {
+		return "Provider 响应格式错误，必须返回包含 allow 布尔字段的 JSON"
+	}
+	return "Provider 连接失败，请检查 URL、网络或代理"
 }
 
 func isModerationProviderTimeout(err error) bool {
@@ -356,11 +449,14 @@ func ModerateWithProvider(ctx context.Context, client *http.Client, provider Mod
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return ModerationDecision{}, fmt.Errorf("moderation provider status %d", resp.StatusCode)
+		return ModerationDecision{}, &moderationProviderHTTPError{StatusCode: resp.StatusCode}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil || len(bytes.TrimSpace(body)) == 0 {
-		return ModerationDecision{}, errors.New("moderation provider returned empty response")
+	if err != nil {
+		return ModerationDecision{}, &moderationProviderResponseError{reason: "read body"}
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return ModerationDecision{}, &moderationProviderResponseError{reason: "empty body"}
 	}
 	var envelope struct {
 		Choices []struct {
@@ -379,7 +475,7 @@ func ModerateWithProvider(ctx context.Context, client *http.Client, provider Mod
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return ModerationDecision{}, err
+		return ModerationDecision{}, &moderationProviderResponseError{reason: "invalid JSON envelope"}
 	}
 	text := envelope.OutputText
 	if text == "" && len(envelope.Choices) > 0 {
@@ -392,7 +488,11 @@ func ModerateWithProvider(ctx context.Context, client *http.Client, provider Mod
 		text = envelope.Content[0].Text
 	}
 	if text == "" {
-		return ModerationDecision{}, errors.New("moderation provider response missing decision")
+		return ModerationDecision{}, &moderationProviderResponseError{reason: "missing decision text"}
 	}
-	return ParseStructuredModerationDecision([]byte(text))
+	decision, err := ParseStructuredModerationDecision([]byte(text))
+	if err != nil {
+		return ModerationDecision{}, &moderationProviderResponseError{reason: "decision must contain allow"}
+	}
+	return decision, nil
 }

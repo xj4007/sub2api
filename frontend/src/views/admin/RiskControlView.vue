@@ -1787,6 +1787,16 @@ async function testCustomProvider(provider: typeof configForm.providers[number])
     const result = await adminAPI.riskControl.testProvider({
       provider_id: id,
       api_key: provider.api_key,
+      provider: {
+        id,
+        base_url: provider.base_url,
+        endpoint: provider.endpoint,
+        model: provider.model,
+        priority: Number(provider.priority) || 0,
+        enabled: provider.enabled,
+        timeout_ms: Number(provider.timeout_ms) || 0,
+        note: provider.note,
+      },
       prompt: 'This is a provider connectivity test. Return allow=true as JSON.',
     })
     providerTestResult[id] = { ok: true, message: result.allow ? '请求成功：Provider 返回 allow=true' : '请求成功：Provider 返回 allow=false' }

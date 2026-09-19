@@ -296,6 +296,16 @@ export async function testProvider(payload: {
   provider_id: string
   api_key?: string
   prompt?: string
+  provider?: {
+    id: string
+    base_url: string
+    endpoint: ModerationProviderEndpoint
+    model: string
+    priority: number
+    enabled: boolean
+    timeout_ms: number
+    note?: string
+  }
 }): Promise<TestModerationProviderResponse> {
   const { data } = await apiClient.post<TestModerationProviderResponse>('/admin/risk-control/providers/test', payload)
   return data

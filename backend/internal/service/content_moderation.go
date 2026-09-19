@@ -1120,6 +1120,9 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 	}
 
 	flagged, highestCategory, highestScore := evaluateModerationScores(result.CategoryScores, cfg.Thresholds)
+	if result.ExplicitFlagged {
+		flagged = true
+	}
 	action := ContentModerationActionAllow
 	blocked := false
 	if allowBlock && flagged && cfg.Mode == ContentModerationModePreBlock {
@@ -1559,14 +1562,17 @@ func (s *ContentModerationService) saveModerationConfig(ctx context.Context, raw
 
 func parseContentModerationConfig(raw string) (*ContentModerationConfig, error) {
 	cfg := defaultContentModerationConfig()
-	if strings.TrimSpace(raw) == "" {
-		cfg.normalize()
-		return cfg, nil
-	}
-	if err := json.Unmarshal([]byte(raw), cfg); err != nil {
-		return nil, infraerrors.BadRequest("INVALID_CONTENT_MODERATION_CONFIG", "内容审计配置不是有效 JSON")
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), cfg); err != nil {
+			return nil, infraerrors.BadRequest("INVALID_CONTENT_MODERATION_CONFIG", "内容审计配置不是有效 JSON")
+		}
 	}
 	cfg.normalize()
+	providers, err := normalizeModerationProviders(cfg.Providers)
+	if err != nil {
+		return nil, infraerrors.BadRequest("INVALID_CONTENT_MODERATION_PROVIDERS", err.Error())
+	}
+	cfg.Providers = providers
 	return cfg, nil
 }
 
@@ -2757,9 +2763,10 @@ type moderationAPIResponse struct {
 }
 
 type moderationAPIResult struct {
-	Flagged        bool               `json:"flagged"`
-	CategoryScores map[string]float64 `json:"category_scores"`
-	ProviderID     string             `json:"provider_id,omitempty"`
+	Flagged         bool               `json:"flagged"`
+	ExplicitFlagged bool               `json:"-"`
+	CategoryScores  map[string]float64 `json:"category_scores"`
+	ProviderID      string             `json:"provider_id,omitempty"`
 }
 
 func evaluateModerationScores(scores map[string]float64, thresholds map[string]float64) (bool, string, float64) {

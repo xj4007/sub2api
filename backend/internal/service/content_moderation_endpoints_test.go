@@ -25,6 +25,20 @@ func TestNormalizeModerationEndpoint_OnlyAllowsThreeProtocols(t *testing.T) {
 func TestNormalizeModerationBaseURL_AcceptsOptionalV1Suffix(t *testing.T) {
 	require.Equal(t, "https://example.test", normalizeModerationBaseURL("https://example.test/v1/"))
 	require.Equal(t, "https://example.test", normalizeModerationBaseURL("https://example.test"))
+	require.Equal(t, "https://example.test", normalizeModerationBaseURL("https://example.test/v1/chat/completions"))
+	_, err := ParseModerationProviderConfig([]byte(`{"providers":[{"id":"p1","base_url":"https://example.test/v1/completions","endpoint":"chat_completions"}]}`))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "legacy /v1/completions")
+}
+
+func TestLoadConfig_RejectsLegacyCompletionsProvider(t *testing.T) {
+	settings := &contentModerationTestSettingRepo{values: map[string]string{
+		SettingKeyContentModerationConfig: `{"providers":[{"id":"legacy","base_url":"https://example.test/v1/completions","endpoint":"chat_completions","model":"legacy-model","api_key":"test-key","enabled":true}]}`,
+	}}
+	svc := NewContentModerationService(settings, nil, nil, nil, nil, nil, nil, nil)
+	_, err := svc.GetConfig(context.Background())
+	require.Equal(t, http.StatusBadRequest, infraerrors.Code(err))
+	require.Contains(t, infraerrors.Message(err), "legacy /v1/completions")
 }
 
 func TestParseModerationProviderConfig_RejectsMissingURLKeyModel(t *testing.T) {
@@ -115,6 +129,35 @@ func TestCustomModerationProvider_NonTimeoutDisablesAndTimeoutKeepsEnabled(t *te
 	}
 }
 
+func TestTestCustomModerationProvider_UsesDraftProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/chat/completions", r.URL.Path)
+		require.Equal(t, "Bearer draft-key", r.Header.Get("Authorization"))
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.Equal(t, "draft-model", body["model"])
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"allow\":true}"}}]}`))
+	}))
+	defer server.Close()
+	cfg := defaultContentModerationConfig()
+	raw, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	settings := &contentModerationTestSettingRepo{values: map[string]string{SettingKeyContentModerationConfig: string(raw)}}
+	svc := NewContentModerationService(settings, nil, nil, nil, nil, nil, nil, nil)
+	result, err := svc.TestCustomModerationProvider(context.Background(), TestModerationProviderInput{
+		ProviderID: "draft",
+		APIKey:     "draft-key",
+		Provider: &ModerationProviderConfig{
+			ID:       "draft",
+			BaseURL:  server.URL + "/v1/chat/completions",
+			Endpoint: ModerationEndpointChatCompletions,
+			Model:    "draft-model",
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, result.Allowed)
+}
+
 func TestTestCustomModerationProvider_MapsProviderHTTPFailureAndDisables(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -131,6 +174,108 @@ func TestTestCustomModerationProvider_MapsProviderHTTPFailureAndDisables(t *test
 	var saved ContentModerationConfig
 	require.NoError(t, json.Unmarshal([]byte(settings.values[SettingKeyContentModerationConfig]), &saved))
 	require.False(t, saved.Providers[0].Enabled)
+}
+
+func TestTestCustomModerationProvider_ReturnsSafeDiagnostics(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"unauthorized", http.StatusUnauthorized, `{"error":"test-key is invalid"}`, "Provider API Key 无效或无权限"},
+		{"not found", http.StatusNotFound, `{"error":"test-key endpoint missing"}`, "Provider 返回 404，请检查 Base URL、Endpoint 和 Model"},
+		{"malformed response", http.StatusOK, `{"choices":[{"message":{"content":"not-json"}}]}`, "Provider 响应格式错误，必须返回包含 allow 布尔字段的 JSON"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+			cfg := defaultContentModerationConfig()
+			cfg.Providers = []ModerationProviderConfig{{ID: "primary", BaseURL: server.URL, Endpoint: ModerationEndpointChatCompletions, Model: "moderator", APIKey: "test-key", Enabled: true}}
+			raw, err := json.Marshal(cfg)
+			require.NoError(t, err)
+			settings := &contentModerationTestSettingRepo{values: map[string]string{SettingKeyContentModerationConfig: string(raw)}}
+			svc := NewContentModerationService(settings, nil, nil, nil, nil, nil, nil, nil)
+			_, err = svc.TestCustomModerationProvider(context.Background(), TestModerationProviderInput{ProviderID: "primary"})
+			require.Equal(t, http.StatusBadGateway, infraerrors.Code(err))
+			require.Equal(t, tt.want, infraerrors.Message(err))
+			require.NotContains(t, infraerrors.Message(err), "test-key")
+		})
+	}
+}
+
+func TestTestCustomModerationProvider_DraftFailureDoesNotDisableSavedProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+	cfg := defaultContentModerationConfig()
+	cfg.Providers = []ModerationProviderConfig{{ID: "primary", BaseURL: server.URL, Endpoint: ModerationEndpointChatCompletions, Model: "saved-model", APIKey: "saved-key", Enabled: true}}
+	raw, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	settings := &contentModerationTestSettingRepo{values: map[string]string{SettingKeyContentModerationConfig: string(raw)}}
+	svc := NewContentModerationService(settings, nil, nil, nil, nil, nil, nil, nil)
+	_, err = svc.TestCustomModerationProvider(context.Background(), TestModerationProviderInput{
+		ProviderID: "primary",
+		Provider: &ModerationProviderConfig{
+			ID:       "primary",
+			BaseURL:  server.URL,
+			Endpoint: ModerationEndpointChatCompletions,
+			Model:    "draft-model",
+			Enabled:  true,
+		},
+	})
+	require.Equal(t, http.StatusBadGateway, infraerrors.Code(err))
+	var saved ContentModerationConfig
+	require.NoError(t, json.Unmarshal([]byte(settings.values[SettingKeyContentModerationConfig]), &saved))
+	require.True(t, saved.Providers[0].Enabled)
+}
+
+func TestTestCustomModerationProvider_MissingDraftAPIKeyReturnsBadRequest(t *testing.T) {
+	settings := &contentModerationTestSettingRepo{values: map[string]string{}}
+	svc := NewContentModerationService(settings, nil, nil, nil, nil, nil, nil, nil)
+	_, err := svc.TestCustomModerationProvider(context.Background(), TestModerationProviderInput{
+		ProviderID: "draft",
+		Provider: &ModerationProviderConfig{
+			ID:       "draft",
+			BaseURL:  "https://moderator.example",
+			Endpoint: ModerationEndpointChatCompletions,
+			Model:    "draft-model",
+		},
+	})
+	require.Equal(t, http.StatusBadRequest, infraerrors.Code(err))
+	require.Contains(t, err.Error(), "Provider 未配置 API Key")
+}
+
+func TestCustomModerationProvider_AllowTrueFlaggedDoesNotBlock(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"allow\":true,\"flagged\":true}"}}]}`))
+	}))
+	defer server.Close()
+	cfg := defaultContentModerationConfig()
+	cfg.Mode = ContentModerationModePreBlock
+	cfg.Providers = []ModerationProviderConfig{{ID: "primary", BaseURL: server.URL, Endpoint: ModerationEndpointChatCompletions, Model: "moderator", APIKey: "test-key", Enabled: true}}
+	svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
+	decision := svc.checkSync(context.Background(), ContentModerationCheckInput{}, cfg, ContentModerationInput{Text: "safe"}, "hash", nil, true)
+	require.False(t, decision.Blocked)
+	require.True(t, decision.Allowed)
+}
+
+func TestCustomModerationProvider_AllowFalseBlocksWithoutCategoryScores(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"allow\":false}"}}]}`))
+	}))
+	defer server.Close()
+	cfg := defaultContentModerationConfig()
+	cfg.Mode = ContentModerationModePreBlock
+	cfg.Providers = []ModerationProviderConfig{{ID: "primary", BaseURL: server.URL, Endpoint: ModerationEndpointChatCompletions, Model: "moderator", APIKey: "test-key", Enabled: true}}
+	svc := NewContentModerationService(nil, nil, nil, nil, nil, nil, nil, nil)
+	decision := svc.checkSync(context.Background(), ContentModerationCheckInput{}, cfg, ContentModerationInput{Text: "unsafe"}, "hash", nil, true)
+	require.True(t, decision.Blocked)
+	require.False(t, decision.Allowed)
 }
 
 func TestContentModerationGetConfig_CustomProviderMasksAPIKey(t *testing.T) {

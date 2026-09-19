@@ -69,9 +69,10 @@ type contentModerationAPIKeyTestRequest struct {
 }
 
 type contentModerationProviderTestRequest struct {
-	ProviderID string `json:"provider_id" binding:"required"`
-	APIKey     string `json:"api_key"`
-	Prompt     string `json:"prompt"`
+	ProviderID string                            `json:"provider_id" binding:"required"`
+	APIKey     string                            `json:"api_key"`
+	Prompt     string                            `json:"prompt"`
+	Provider   *service.ModerationProviderConfig `json:"provider,omitempty"`
 }
 
 type contentModerationHashRequest struct {
@@ -167,6 +168,7 @@ func (h *ContentModerationHandler) TestProvider(c *gin.Context) {
 		ProviderID: req.ProviderID,
 		APIKey:     req.APIKey,
 		Prompt:     req.Prompt,
+		Provider:   req.Provider,
 	})
 	if err != nil {
 		response.ErrorFrom(c, err)

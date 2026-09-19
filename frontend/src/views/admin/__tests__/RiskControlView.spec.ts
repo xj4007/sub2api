@@ -13,6 +13,7 @@ const {
   listLogs,
   getGroups,
   getProxies,
+  testProvider,
   showError,
   showSuccess,
 } = vi.hoisted(() => ({
@@ -22,6 +23,7 @@ const {
   listLogs: vi.fn(),
   getGroups: vi.fn(),
   getProxies: vi.fn(),
+  testProvider: vi.fn(),
   showError: vi.fn(),
   showSuccess: vi.fn(),
 }))
@@ -34,6 +36,7 @@ vi.mock('@/api/admin', () => ({
       getStatus,
       listLogs,
       testAPIKeys: vi.fn(),
+      testProvider,
       deleteFlaggedHash: vi.fn(),
       clearFlaggedHashes: vi.fn(),
       unbanUser: vi.fn(),
@@ -198,6 +201,7 @@ describe('admin RiskControlView', () => {
     getStatus.mockReset()
     listLogs.mockReset()
     getGroups.mockReset()
+    testProvider.mockReset()
     showError.mockReset()
     showSuccess.mockReset()
 
@@ -206,6 +210,7 @@ describe('admin RiskControlView', () => {
     listLogs.mockResolvedValue({ items: [], total: 0, page: 1, page_size: 20, pages: 1 })
     getGroups.mockResolvedValue([])
     getProxies.mockResolvedValue([])
+    testProvider.mockResolvedValue({ provider_id: 'provider-1', allow: true, flagged: false })
     updateConfig.mockImplementation(async (payload: UpdateContentModerationConfig) => ({
       ...baseConfig(),
       ...payload,
@@ -330,6 +335,44 @@ describe('admin RiskControlView', () => {
     expect(updateConfig).toHaveBeenCalledWith(expect.objectContaining({
       providers: expect.arrayContaining([expect.objectContaining({ id: 'safety-primary', api_key: '' })]),
     }))
+  })
+
+  it('tests an unsaved custom provider draft with its current form values', async () => {
+    const wrapper = mount(RiskControlView, {
+      global: {
+        stubs: {
+          AppLayout: AppLayoutStub,
+          BaseDialog: BaseDialogStub,
+          Icon: true,
+          Select: true,
+          Toggle: true,
+          Pagination: true,
+          ModelWhitelistSelector: ModelWhitelistSelectorStub,
+          ProxySelector: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    await findButtonByText(wrapper, 'admin.riskControl.openSettings').trigger('click')
+    await wrapper.get('[data-test="moderation-providers-tab"]').trigger('click')
+    await findButtonByText(wrapper, '新增 Provider').trigger('click')
+    await wrapper.get('input[placeholder="https://moderator.example 或 https://moderator.example/v1"]').setValue('https://moderator.example/v1/chat/completions')
+    await wrapper.get('input[placeholder="moderation-model"]').setValue('moderator-model')
+    await wrapper.get('input[placeholder="API Key（留空保留原密钥）"]').setValue('draft-key')
+    await findButtonByText(wrapper, '测试请求').trigger('click')
+    await flushPromises()
+
+    expect(testProvider).toHaveBeenCalledWith(expect.objectContaining({
+      provider_id: 'provider-1',
+      api_key: 'draft-key',
+      provider: expect.objectContaining({
+        base_url: 'https://moderator.example/v1/chat/completions',
+        endpoint: 'chat_completions',
+        model: 'moderator-model',
+      }),
+    }))
+    expect(showSuccess).toHaveBeenCalledWith('Provider 测试请求成功')
   })
 
   it('describes worker runtime as async audit and pre-block record processing', async () => {
