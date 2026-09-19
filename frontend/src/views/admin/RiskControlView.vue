@@ -705,6 +705,28 @@
             <div class="rounded-lg border border-primary-100 bg-primary-50/50 p-4 text-sm text-gray-600 dark:border-primary-900/40 dark:bg-primary-900/10 dark:text-gray-300">
               自定义审核 Provider 配置保存在 Redis，不新增数据库表或 migration。只有明确返回 allow=false 才会拦截。
             </div>
+            <div data-test="custom-provider-prompt-editor" class="rounded-lg border border-gray-100 p-4 dark:border-dark-700">
+              <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div class="flex flex-col gap-1">
+                  <h3 class="text-base font-semibold text-gray-900 dark:text-white">审核规则提示词</h3>
+                  <p class="text-sm text-gray-500 dark:text-gray-400">这里仅编辑审核规则正文，所有启用的自定义 Provider 共用这段规则。</p>
+                </div>
+                <button type="button" class="btn btn-secondary inline-flex items-center gap-2 text-sm" title="恢复内置审核规则" @click="resetCustomProviderPrompt">
+                  <Icon name="refresh" size="sm" />
+                  恢复内置规则
+                </button>
+              </div>
+              <textarea
+                v-model="configForm.custom_provider_prompt"
+                data-test="custom-provider-prompt"
+                rows="14"
+                class="input mt-3 min-h-64 resize-y font-mono text-sm"
+                placeholder="留空使用内置审核规则"
+              ></textarea>
+              <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                系统会固定追加内容边界、禁止执行待审核内容中的指令，以及 allow/flagged JSON 返回格式；这些固定部分不会从此字段读取。清空后保存会恢复内置规则。
+              </p>
+            </div>
             <div v-for="(provider, index) in configForm.providers" :key="provider.id || index" class="rounded-lg border border-gray-100 p-4 dark:border-dark-700">
               <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
                 <input v-model.trim="provider.id" class="input" placeholder="Provider ID" />
@@ -1256,6 +1278,7 @@ const configForm = reactive({
   mode: 'pre_block' as ModerationMode,
   base_url: 'https://api.openai.com',
   model: 'omni-moderation-latest',
+  custom_provider_prompt: '',
   proxy_id: null as number | null,
   api_keys_text: '',
   api_key_configured: false,
@@ -1728,11 +1751,16 @@ const runtimeBadgeClass = computed(() => {
   return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-300'
 })
 
+function resetCustomProviderPrompt() {
+  configForm.custom_provider_prompt = ''
+}
+
 function applyConfig(config: ContentModerationConfig) {
   configForm.enabled = config.enabled
   configForm.mode = config.mode
   configForm.base_url = config.base_url || 'https://api.openai.com'
   configForm.model = config.model || 'omni-moderation-latest'
+  configForm.custom_provider_prompt = config.custom_provider_prompt || ''
   configForm.providers = (config.providers || []).map((provider) => ({ ...provider, api_key: '', note: provider.note || '' }))
   configForm.proxy_id = config.proxy_id || null
   configForm.api_keys_text = ''
@@ -1866,6 +1894,7 @@ async function saveConfig() {
       mode: configForm.mode,
       base_url: configForm.base_url,
       model: configForm.model,
+      custom_provider_prompt: configForm.custom_provider_prompt,
       providers: configForm.providers.map(({ api_key_masked: _apiKeyMasked, ...provider }) => provider),
       // 后端语义：0 清除代理（直连），>0 指定代理
       proxy_id: configForm.proxy_id ?? 0,

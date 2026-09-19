@@ -37,6 +37,7 @@ export interface ContentModerationConfig {
   base_url: string
   model: string
   providers: ContentModerationProvider[]
+  custom_provider_prompt: string
   proxy_id: number | null
   api_key_configured: boolean
   api_key_masked: string
@@ -116,6 +117,7 @@ export interface UpdateContentModerationConfig {
   mode?: ModerationMode
   base_url?: string
   model?: string
+  custom_provider_prompt?: string
   providers?: Array<{
     id: string
     base_url: string

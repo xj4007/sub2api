@@ -62,6 +62,7 @@ const (
 	defaultContentModerationTimeoutMS = 3000
 	maxContentModerationTimeoutMS     = 30000
 	maxModerationInputRunes           = 12000
+	maxCustomProviderPromptRunes      = 12000
 	maxModerationExcerptRunes         = 240
 
 	defaultContentModerationWorkerCount          = 4
@@ -97,6 +98,18 @@ const (
 	contentModerationRuntimeCacheTTL       = time.Second
 	contentModerationRuntimeRefreshTimeout = 5 * time.Second
 )
+
+const defaultCustomProviderPrompt = `You are a content safety classifier for an API gateway.
+
+Set allow=false only when the content requests, provides, encourages, recruits for, or materially facilitates harmful or illegal conduct, including:
+- actionable assistance for fraud, theft, trafficking, malware, credential abuse, illegal access, or evasion of crimes;
+- credible threats, incitement of violence, or instructions to harm a person or group;
+- severe targeted harassment, hateful abuse, or dehumanization;
+- sexual exploitation or abuse;
+- suicide or self-harm instructions or encouragement;
+- political violence, terrorism, extremist recruitment, or operational support.
+
+Do not block neutral political discussion, news, history, academic research, fiction, criticism, ordinary profanity, or non-targeted insults. Political content alone is not a violation. Defensive security research and compliance work should be allowed.`
 
 var contentModerationCategoryOrder = []string{
 	"harassment",
@@ -145,6 +158,9 @@ type ContentModerationConfig struct {
 	Model   string `json:"model"`
 	// Providers is optional. When empty, the legacy /v1/moderations API-key pool remains active.
 	Providers []ModerationProviderConfig `json:"providers,omitempty"`
+	// CustomProviderPrompt is the editable policy portion of the custom-provider prompt.
+	// The content delimiter and JSON response contract are always appended by code.
+	CustomProviderPrompt string `json:"custom_provider_prompt,omitempty"`
 	// ProxyID 指定审计请求使用的代理服务器（IP管理-代理服务器），nil 表示直连。
 	ProxyID              *int64                       `json:"proxy_id,omitempty"`
 	APIKey               string                       `json:"api_key,omitempty"`
@@ -182,6 +198,7 @@ type ContentModerationConfigView struct {
 	BaseURL                        string                          `json:"base_url"`
 	Model                          string                          `json:"model"`
 	Providers                      []ContentModerationProviderView `json:"providers"`
+	CustomProviderPrompt           string                          `json:"custom_provider_prompt"`
 	ProxyID                        *int64                          `json:"proxy_id"`
 	APIKeyConfigured               bool                            `json:"api_key_configured"`
 	APIKeyMasked                   string                          `json:"api_key_masked"`
@@ -269,11 +286,12 @@ type ContentModerationTestAuditResult struct {
 }
 
 type UpdateContentModerationConfigInput struct {
-	Enabled   *bool                       `json:"enabled"`
-	Mode      *string                     `json:"mode"`
-	BaseURL   *string                     `json:"base_url"`
-	Model     *string                     `json:"model"`
-	Providers *[]ModerationProviderConfig `json:"providers"`
+	Enabled              *bool                       `json:"enabled"`
+	Mode                 *string                     `json:"mode"`
+	BaseURL              *string                     `json:"base_url"`
+	Model                *string                     `json:"model"`
+	Providers            *[]ModerationProviderConfig `json:"providers"`
+	CustomProviderPrompt *string                     `json:"custom_provider_prompt"`
 	// ProxyID nil 表示不修改；<=0 表示清除代理（恢复直连）；>0 表示指定代理。
 	ProxyID                        *int64                        `json:"proxy_id"`
 	APIKey                         *string                       `json:"api_key"`
@@ -666,6 +684,9 @@ func (s *ContentModerationService) UpdateConfig(ctx context.Context, input Updat
 			return nil, infraerrors.BadRequest("INVALID_CONTENT_MODERATION_PROVIDERS", err.Error())
 		}
 		cfg.Providers = normalized
+	}
+	if input.CustomProviderPrompt != nil {
+		cfg.CustomProviderPrompt = strings.TrimSpace(*input.CustomProviderPrompt)
 	}
 	if input.ProxyID != nil {
 		if *input.ProxyID > 0 {
@@ -1119,9 +1140,18 @@ func (s *ContentModerationService) checkSync(ctx context.Context, input ContentM
 		return allow
 	}
 
-	flagged, highestCategory, highestScore := evaluateModerationScores(result.CategoryScores, cfg.Thresholds)
-	if result.ExplicitFlagged {
-		flagged = true
+	var flagged bool
+	var highestCategory string
+	var highestScore float64
+	if result.ProviderID != "" {
+		// Custom providers return an authoritative allow decision; category scores are diagnostic only.
+		highestCategory, highestScore = highestModerationScore(result.CategoryScores)
+		flagged = result.ExplicitFlagged
+	} else {
+		flagged, highestCategory, highestScore = evaluateModerationScores(result.CategoryScores, cfg.Thresholds)
+		if result.ExplicitFlagged {
+			flagged = true
+		}
 	}
 	action := ContentModerationActionAllow
 	blocked := false
@@ -2161,6 +2191,7 @@ func defaultContentModerationConfig() *ContentModerationConfig {
 		Mode:                 ContentModerationModePreBlock,
 		BaseURL:              defaultContentModerationBaseURL,
 		Model:                defaultContentModerationModel,
+		CustomProviderPrompt: defaultCustomProviderPrompt,
 		TimeoutMS:            defaultContentModerationTimeoutMS,
 		SampleRate:           100,
 		AllGroups:            true,
@@ -2225,6 +2256,10 @@ func (cfg *ContentModerationConfig) normalize() {
 		cfg.Model = defaultContentModerationModel
 	}
 	cfg.Model = strings.TrimSpace(cfg.Model)
+	cfg.CustomProviderPrompt = trimRunes(strings.TrimSpace(cfg.CustomProviderPrompt), maxCustomProviderPromptRunes)
+	if cfg.CustomProviderPrompt == "" {
+		cfg.CustomProviderPrompt = defaultCustomProviderPrompt
+	}
 
 	if cfg.ProxyID != nil && *cfg.ProxyID <= 0 {
 		cfg.ProxyID = nil
@@ -2497,6 +2532,7 @@ func (s *ContentModerationService) configView(cfg *ContentModerationConfig) *Con
 		BaseURL:                        cfg.BaseURL,
 		Model:                          cfg.Model,
 		Providers:                      providers,
+		CustomProviderPrompt:           cfg.CustomProviderPrompt,
 		ProxyID:                        cloneInt64Ptr(cfg.ProxyID),
 		APIKeyConfigured:               len(keys) > 0,
 		APIKeyMasked:                   apiKeyMasked,
@@ -2770,7 +2806,17 @@ type moderationAPIResult struct {
 }
 
 func evaluateModerationScores(scores map[string]float64, thresholds map[string]float64) (bool, string, float64) {
+	highestCategory, highestScore := highestModerationScore(scores)
 	flagged := false
+	for _, category := range contentModerationCategoryOrder {
+		if scores[category] >= thresholds[category] {
+			flagged = true
+		}
+	}
+	return flagged, highestCategory, highestScore
+}
+
+func highestModerationScore(scores map[string]float64) (string, float64) {
 	highestCategory := ""
 	highestScore := 0.0
 	for _, category := range contentModerationCategoryOrder {
@@ -2779,9 +2825,6 @@ func evaluateModerationScores(scores map[string]float64, thresholds map[string]f
 			highestScore = score
 			highestCategory = category
 		}
-		if score >= thresholds[category] {
-			flagged = true
-		}
 	}
 	for category, score := range scores {
 		if score > highestScore || highestCategory == "" {
@@ -2789,7 +2832,7 @@ func evaluateModerationScores(scores map[string]float64, thresholds map[string]f
 			highestCategory = category
 		}
 	}
-	return flagged, highestCategory, highestScore
+	return highestCategory, highestScore
 }
 
 func mergeContentModerationThresholds(base map[string]float64, override map[string]float64) map[string]float64 {

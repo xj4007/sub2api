@@ -82,6 +82,7 @@ const baseConfig = (): ContentModerationConfig => ({
   base_url: 'https://api.openai.com',
   model: 'omni-moderation-latest',
   providers: [],
+  custom_provider_prompt: 'default moderation policy',
   proxy_id: null,
   api_key_configured: false,
   api_key_masked: '',
@@ -326,6 +327,9 @@ describe('admin RiskControlView', () => {
     await findButtonByText(wrapper, 'admin.riskControl.openSettings').trigger('click')
     await wrapper.get('[data-test="moderation-providers-tab"]').trigger('click')
     expect(wrapper.text()).toContain('自定义审核 Provider 配置保存在 Redis')
+    await findButtonByText(wrapper, '恢复内置规则').trigger('click')
+    expect((wrapper.get('[data-test="custom-provider-prompt"]').element as HTMLTextAreaElement).value).toBe('')
+    await wrapper.get('[data-test="custom-provider-prompt"]').setValue('Only block the configured test policy.')
     await findButtonByText(wrapper, '新增 Provider').trigger('click')
     await wrapper.get('input[placeholder="Provider ID"]').setValue('safety-primary')
     expect(wrapper.text()).not.toContain('provider-canary-secret')
@@ -333,6 +337,7 @@ describe('admin RiskControlView', () => {
     await findButtonByText(wrapper, 'admin.riskControl.saveConfig').trigger('click')
     await flushPromises()
     expect(updateConfig).toHaveBeenCalledWith(expect.objectContaining({
+      custom_provider_prompt: 'Only block the configured test policy.',
       providers: expect.arrayContaining([expect.objectContaining({ id: 'safety-primary', api_key: '' })]),
     }))
   })
