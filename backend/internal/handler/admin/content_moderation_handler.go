@@ -20,11 +20,14 @@ func NewContentModerationHandler(svc *service.ContentModerationService) *Content
 }
 
 type contentModerationConfigRequest struct {
-	Enabled   *bool                               `json:"enabled"`
-	Mode      *string                             `json:"mode"`
-	BaseURL   *string                             `json:"base_url"`
-	Model     *string                             `json:"model"`
-	Providers *[]service.ModerationProviderConfig `json:"providers"`
+	Engine               *string                                               `json:"engine"`
+	EngineConfigs        map[string]service.UpdateContentModerationEngineInput `json:"engine_configs"`
+	Enabled              *bool                                                 `json:"enabled"`
+	Mode                 *string                                               `json:"mode"`
+	BaseURL              *string                                               `json:"base_url"`
+	Model                *string                                               `json:"model"`
+	Providers            *[]service.ModerationProviderConfig                   `json:"providers"`
+	CustomProviderPrompt *string                                               `json:"custom_provider_prompt"`
 	// 审计请求使用的代理服务器：null 不修改；0 清除（直连）；>0 指定代理。
 	ProxyID              *int64              `json:"proxy_id"`
 	APIKey               *string             `json:"api_key"`
@@ -59,13 +62,15 @@ type contentModerationConfigRequest struct {
 }
 
 type contentModerationAPIKeyTestRequest struct {
-	APIKeys   []string `json:"api_keys"`
-	BaseURL   string   `json:"base_url"`
-	Model     string   `json:"model"`
-	TimeoutMS int      `json:"timeout_ms"`
-	ProxyID   *int64   `json:"proxy_id"`
-	Prompt    string   `json:"prompt"`
-	Images    []string `json:"images"`
+	Engine     string              `json:"engine"`
+	Thresholds *map[string]float64 `json:"thresholds"`
+	APIKeys    []string            `json:"api_keys"`
+	BaseURL    string              `json:"base_url"`
+	Model      string              `json:"model"`
+	TimeoutMS  int                 `json:"timeout_ms"`
+	ProxyID    *int64              `json:"proxy_id"`
+	Prompt     string              `json:"prompt"`
+	Images     []string            `json:"images"`
 }
 
 type contentModerationProviderTestRequest struct {
@@ -95,11 +100,13 @@ func (h *ContentModerationHandler) UpdateConfig(c *gin.Context) {
 		return
 	}
 	cfg, err := h.service.UpdateConfig(c.Request.Context(), service.UpdateContentModerationConfigInput{
+		Engine: req.Engine, EngineConfigs: req.EngineConfigs,
 		Enabled:                        req.Enabled,
 		Mode:                           req.Mode,
 		BaseURL:                        req.BaseURL,
 		Model:                          req.Model,
 		Providers:                      req.Providers,
+		CustomProviderPrompt:           req.CustomProviderPrompt,
 		ProxyID:                        req.ProxyID,
 		APIKey:                         req.APIKey,
 		APIKeys:                        req.APIKeys,
@@ -143,6 +150,7 @@ func (h *ContentModerationHandler) TestAPIKeys(c *gin.Context) {
 		return
 	}
 	result, err := h.service.TestAPIKeys(c.Request.Context(), service.TestContentModerationAPIKeysInput{
+		Engine: req.Engine, Thresholds: req.Thresholds,
 		APIKeys:   req.APIKeys,
 		BaseURL:   req.BaseURL,
 		Model:     req.Model,
