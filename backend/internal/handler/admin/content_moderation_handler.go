@@ -20,14 +20,15 @@ func NewContentModerationHandler(svc *service.ContentModerationService) *Content
 }
 
 type contentModerationConfigRequest struct {
-	Engine               *string                                               `json:"engine"`
-	EngineConfigs        map[string]service.UpdateContentModerationEngineInput `json:"engine_configs"`
-	Enabled              *bool                                                 `json:"enabled"`
-	Mode                 *string                                               `json:"mode"`
-	BaseURL              *string                                               `json:"base_url"`
-	Model                *string                                               `json:"model"`
-	Providers            *[]service.ModerationProviderConfig                   `json:"providers"`
-	CustomProviderPrompt *string                                               `json:"custom_provider_prompt"`
+	Engine                *string                                               `json:"engine"`
+	EngineConfigs         map[string]service.UpdateContentModerationEngineInput `json:"engine_configs"`
+	Enabled               *bool                                                 `json:"enabled"`
+	Mode                  *string                                               `json:"mode"`
+	BaseURL               *string                                               `json:"base_url"`
+	Model                 *string                                               `json:"model"`
+	Providers             *[]service.ModerationProviderConfig                   `json:"providers"`
+	CustomProviderPrompt  *string                                               `json:"custom_provider_prompt"`
+	CustomPolicyThreshold *float64                                              `json:"custom_policy_threshold"`
 	// 审计请求使用的代理服务器：null 不修改；0 清除（直连）；>0 指定代理。
 	ProxyID              *int64              `json:"proxy_id"`
 	APIKey               *string             `json:"api_key"`
@@ -107,6 +108,7 @@ func (h *ContentModerationHandler) UpdateConfig(c *gin.Context) {
 		Model:                          req.Model,
 		Providers:                      req.Providers,
 		CustomProviderPrompt:           req.CustomProviderPrompt,
+		CustomPolicyThreshold:          req.CustomPolicyThreshold,
 		ProxyID:                        req.ProxyID,
 		APIKey:                         req.APIKey,
 		APIKeys:                        req.APIKeys,

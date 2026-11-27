@@ -727,7 +727,7 @@
               <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div class="flex flex-col gap-1">
                   <h3 class="text-base font-semibold text-gray-900 dark:text-white">审核规则提示词</h3>
-                  <p class="text-sm text-gray-500 dark:text-gray-400">这里仅编辑审核规则正文，所有启用的 Chat Completions Provider 共用这段规则；System One（Jev）固定使用内置 13 类审核规则。</p>
+                  <p class="text-sm text-gray-500 dark:text-gray-400">这里仅编辑审核规则正文：Chat Completions Provider 直接使用这段规则；System One（Jev）会额外用这段策略生成一个 custom_policy 判定问题（按下方阈值判定），内置 13 类规则仍然保留。</p>
                 </div>
                 <button type="button" class="btn btn-secondary inline-flex items-center gap-2 text-sm" title="恢复内置审核规则" @click="resetCustomProviderPrompt">
                   <Icon name="refresh" size="sm" />
@@ -744,6 +744,14 @@
               <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">
                 系统会固定追加内容边界、禁止执行待审核内容中的指令，以及 allow/flagged JSON 返回格式；这些固定部分不会从此字段读取。清空后保存会恢复内置规则。
               </p>
+              <div class="mt-3 flex flex-col gap-2 border-t border-gray-100 pt-3 dark:border-dark-700 sm:flex-row sm:items-center sm:gap-4">
+                <label for="custom-policy-threshold" class="text-sm font-medium text-gray-700 dark:text-gray-200">System One 自定义策略阈值</label>
+                <div class="flex items-center gap-2">
+                  <input id="custom-policy-threshold" v-model.number="configForm.custom_policy_threshold" data-test="custom-policy-threshold" type="number" min="1" max="100" step="1" class="input w-24" />
+                  <span class="text-sm text-gray-500 dark:text-gray-400">%</span>
+                </div>
+                <p class="text-xs text-gray-500 dark:text-gray-400">仅 System One 使用：custom_policy 分数 ≥ 该阈值即判定违规，默认 50%。Chat Completions 不受影响。</p>
+              </div>
             </div>
             <div v-for="(provider, index) in configForm.providers" :key="provider.id || index" class="rounded-lg border border-gray-100 p-4 dark:border-dark-700">
               <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
@@ -1318,6 +1326,7 @@ const configForm = reactive({
   base_url: 'https://api.openai.com',
   model: 'omni-moderation-latest',
   custom_provider_prompt: '',
+  custom_policy_threshold: 50,
   proxy_id: null as number | null,
   api_keys_text: '',
   api_key_configured: false,
@@ -1849,6 +1858,7 @@ function applyConfig(config: ContentModerationConfig) {
   configForm.base_url = config.base_url || 'https://api.openai.com'
   configForm.model = config.model || 'omni-moderation-latest'
   configForm.custom_provider_prompt = config.custom_provider_prompt || ''
+  configForm.custom_policy_threshold = Math.round((config.custom_policy_threshold ?? 0.5) * 100)
   configForm.providers = (config.providers || []).map((provider) => ({ ...provider, api_key: '', note: provider.note || '' }))
   configForm.proxy_id = config.proxy_id || null
   configForm.api_keys_text = ''
@@ -1998,6 +2008,7 @@ async function saveConfig() {
       base_url: configForm.base_url,
       model: configForm.model,
       custom_provider_prompt: configForm.custom_provider_prompt,
+      custom_policy_threshold: clampPercent(Number(configForm.custom_policy_threshold) || 50) / 100,
       providers: configForm.providers.map(({ api_key_masked: _apiKeyMasked, ...provider }) => provider),
       // 后端语义：0 清除代理（直连），>0 指定代理
       proxy_id: configForm.proxy_id ?? 0,

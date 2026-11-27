@@ -282,7 +282,7 @@ func (s *ContentModerationService) callCustomModerationProviders(ctx context.Con
 			}
 			if err == nil {
 				state, _ := typeSafeText(input)
-				decision, callErr := moderateWithProvider(reqCtx, client, provider, cfg.CustomProviderPrompt, string(text), state, cfg.Thresholds)
+				decision, callErr := moderateWithProvider(reqCtx, client, provider, cfg.CustomProviderPrompt, string(text), state, cfg.Thresholds, cfg.CustomPolicyThreshold)
 				err = callErr
 				if err == nil {
 					cancel()
@@ -363,7 +363,7 @@ func (s *ContentModerationService) TestCustomModerationProvider(ctx context.Cont
 	client, callErr := s.moderationHTTPClient(testCtx, cfg)
 	if callErr == nil {
 		var decision ModerationDecision
-		decision, callErr = moderateWithProvider(testCtx, client, provider, cfg.CustomProviderPrompt, prompt, prompt, cfg.Thresholds)
+		decision, callErr = moderateWithProvider(testCtx, client, provider, cfg.CustomProviderPrompt, prompt, prompt, cfg.Thresholds, cfg.CustomPolicyThreshold)
 		if callErr == nil {
 			cancel()
 			return &TestModerationProviderResult{ProviderID: provider.ID, Allowed: decision.Allowed, Flagged: decision.Flagged, Reason: decision.Reason, Categories: decision.Categories}, nil
@@ -439,20 +439,20 @@ func isModerationProviderTimeout(err error) bool {
 }
 
 func ModerateWithProvider(ctx context.Context, client *http.Client, provider ModerationProviderConfig, input string) (ModerationDecision, error) {
-	return moderateWithProvider(ctx, client, provider, defaultCustomProviderPrompt, input, input, nil)
+	return moderateWithProvider(ctx, client, provider, defaultCustomProviderPrompt, input, input, nil, defaultCustomPolicyThreshold)
 }
 
 // moderateWithProvider evaluates one provider. input is the chat-completions
 // payload (policy prompt or JSON content parts); state is the plain audited
 // text used by systemone providers. thresholds decides flagged for adapters
 // that answer with category scores instead of an allow boolean.
-func moderateWithProvider(ctx context.Context, client *http.Client, provider ModerationProviderConfig, policy, input, state string, thresholds map[string]float64) (ModerationDecision, error) {
+func moderateWithProvider(ctx context.Context, client *http.Client, provider ModerationProviderConfig, policy, input, state string, thresholds map[string]float64, policyThreshold float64) (ModerationDecision, error) {
 	endpoint, err := NormalizeModerationEndpoint(provider.Endpoint)
 	if err != nil {
 		return ModerationDecision{}, err
 	}
 	if endpoint == ModerationEndpointSystemOne {
-		return moderateWithSystemOneProvider(ctx, client, provider, state, thresholds)
+		return moderateWithSystemOneProvider(ctx, client, provider, state, policy, thresholds, policyThreshold)
 	}
 	return moderateWithChatProvider(ctx, client, provider, policy, input)
 }
@@ -550,8 +550,10 @@ func moderateWithChatProvider(ctx context.Context, client *http.Client, provider
 
 // moderateWithSystemOneProvider asks a Jev model through the System One
 // protocol for one noul score per moderation category and turns those scores
-// into an allow/flagged decision with the configured thresholds.
-func moderateWithSystemOneProvider(ctx context.Context, client *http.Client, provider ModerationProviderConfig, state string, thresholds map[string]float64) (ModerationDecision, error) {
+// into an allow/flagged decision with the configured thresholds. When the
+// operator replaced the built-in policy, a custom_policy question is added and
+// its score is compared with policyThreshold (0-1).
+func moderateWithSystemOneProvider(ctx context.Context, client *http.Client, provider ModerationProviderConfig, state, policy string, thresholds map[string]float64, policyThreshold float64) (ModerationDecision, error) {
 	state = strings.TrimSpace(state)
 	if state == "" {
 		return ModerationDecision{}, errModerationProviderNoText
@@ -559,7 +561,15 @@ func moderateWithSystemOneProvider(ctx context.Context, client *http.Client, pro
 	if client == nil {
 		client = http.DefaultClient
 	}
+	if policyThreshold <= 0 {
+		policyThreshold = defaultCustomPolicyThreshold
+	}
 	questions := typeSafeModerationQuestions()
+	policyQuestion := ""
+	if customPolicy := strings.TrimSpace(policy); customPolicy != "" && customPolicy != strings.TrimSpace(defaultCustomProviderPrompt) {
+		policyQuestion = "custom_policy"
+		questions[policyQuestion] = systemOnePolicyQuestion(customPolicy)
+	}
 	raw, err := json.Marshal(map[string]any{
 		"model":     provider.Model,
 		"state":     state,
@@ -612,11 +622,19 @@ func moderateWithSystemOneProvider(ctx context.Context, client *http.Client, pro
 		scores[id] = score
 	}
 	flagged, highestCategory, highestScore := evaluateModerationScores(scores, mergeContentModerationThresholds(ContentModerationDefaultThresholds(), thresholds))
+	reason := fmt.Sprintf("systemone: %s %.3f", highestCategory, highestScore)
+	if policyQuestion != "" {
+		if policyScore := scores[policyQuestion]; policyScore >= policyThreshold {
+			flagged = true
+			highestScore = policyScore
+			reason = fmt.Sprintf("systemone: custom_policy %.3f (threshold %.2f)", policyScore, policyThreshold)
+		}
+	}
 	return ModerationDecision{
 		Allowed:    !flagged,
 		Flagged:    flagged,
 		Categories: scores,
-		Reason:     fmt.Sprintf("systemone: %s %.3f", highestCategory, highestScore),
+		Reason:     reason,
 		Confidence: highestScore,
 	}, nil
 }

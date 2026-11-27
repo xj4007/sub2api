@@ -85,6 +85,7 @@ const baseConfig = (): ContentModerationConfig => ({
   model: 'omni-moderation-latest',
   providers: [],
   custom_provider_prompt: 'default moderation policy',
+  custom_policy_threshold: 0.5,
   proxy_id: null,
   api_key_configured: false,
   api_key_masked: '',
@@ -449,6 +450,8 @@ describe('admin RiskControlView', () => {
     expect(wrapper.text()).toContain('自定义审核 Provider 配置保存在 Redis')
     await findButtonByText(wrapper, '恢复内置规则').trigger('click')
     expect((wrapper.get('[data-test="custom-provider-prompt"]').element as HTMLTextAreaElement).value).toBe('')
+    expect((wrapper.get('[data-test="custom-policy-threshold"]').element as HTMLInputElement).value).toBe('50')
+    await wrapper.get('[data-test="custom-policy-threshold"]').setValue('70')
     await wrapper.get('[data-test="custom-provider-prompt"]').setValue('Only block the configured test policy.')
     await findButtonByText(wrapper, '新增 Provider').trigger('click')
     await wrapper.get('input[placeholder="Provider ID"]').setValue('safety-primary')
@@ -458,6 +461,7 @@ describe('admin RiskControlView', () => {
     await flushPromises()
     expect(updateConfig).toHaveBeenCalledWith(expect.objectContaining({
       custom_provider_prompt: 'Only block the configured test policy.',
+      custom_policy_threshold: 0.7,
       providers: expect.arrayContaining([expect.objectContaining({ id: 'safety-primary', api_key: '' })]),
     }))
   })

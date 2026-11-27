@@ -47,6 +47,7 @@ export interface ContentModerationConfig {
   model: string
   providers: ContentModerationProvider[]
   custom_provider_prompt: string
+  custom_policy_threshold: number
   proxy_id: number | null
   api_key_configured: boolean
   api_key_masked: string
@@ -143,6 +144,7 @@ export interface UpdateContentModerationConfig {
     note?: string
     api_key?: string
   }>
+  custom_policy_threshold?: number
   // undefined 不修改；0 清除（直连）；>0 指定代理
   proxy_id?: number
   api_key?: string

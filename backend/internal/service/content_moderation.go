@@ -112,6 +112,11 @@ Set allow=false only when the content requests, provides, encourages, recruits f
 
 Do not block neutral political discussion, news, history, academic research, fiction, criticism, ordinary profanity, or non-targeted insults. Political content alone is not a violation. Defensive security research and compliance work should be allowed.`
 
+// defaultCustomPolicyThreshold is used by System One providers when the stored
+// config has no custom_policy_threshold value (for example configurations
+// written before the field existed).
+const defaultCustomPolicyThreshold = 0.5
+
 var contentModerationCategoryOrder = []string{
 	"harassment",
 	"harassment/threatening",
@@ -164,6 +169,10 @@ type ContentModerationConfig struct {
 	// CustomProviderPrompt is the editable policy portion of the custom-provider prompt.
 	// The content delimiter and JSON response contract are always appended by code.
 	CustomProviderPrompt string `json:"custom_provider_prompt,omitempty"`
+	// CustomPolicyThreshold is the violation threshold (0-1) for the System One
+	// custom-policy question. It rides along in the same Redis-stored config JSON,
+	// so no SQL migration is required; missing values fall back to 0.5.
+	CustomPolicyThreshold float64 `json:"custom_policy_threshold,omitempty"`
 	// ProxyID 指定审计请求使用的代理服务器（IP管理-代理服务器），nil 表示直连。
 	ProxyID              *int64                       `json:"proxy_id,omitempty"`
 	APIKey               string                       `json:"api_key,omitempty"`
@@ -204,6 +213,7 @@ type ContentModerationConfigView struct {
 	Model                          string                                  `json:"model"`
 	Providers                      []ContentModerationProviderView         `json:"providers"`
 	CustomProviderPrompt           string                                  `json:"custom_provider_prompt"`
+	CustomPolicyThreshold          float64                                 `json:"custom_policy_threshold"`
 	ProxyID                        *int64                                  `json:"proxy_id"`
 	APIKeyConfigured               bool                                    `json:"api_key_configured"`
 	APIKeyMasked                   string                                  `json:"api_key_masked"`
@@ -302,6 +312,8 @@ type UpdateContentModerationConfigInput struct {
 	Model                *string                                       `json:"model"`
 	Providers            *[]ModerationProviderConfig                   `json:"providers"`
 	CustomProviderPrompt *string                                       `json:"custom_provider_prompt"`
+	// CustomPolicyThreshold 修改 System One 自定义策略判定阈值（0-1）；nil 表示不修改。
+	CustomPolicyThreshold *float64 `json:"custom_policy_threshold"`
 	// ProxyID nil 表示不修改；<=0 表示清除代理（恢复直连）；>0 表示指定代理。
 	ProxyID                        *int64                        `json:"proxy_id"`
 	APIKey                         *string                       `json:"api_key"`
@@ -701,6 +713,9 @@ func (s *ContentModerationService) UpdateConfig(ctx context.Context, input Updat
 	}
 	if input.CustomProviderPrompt != nil {
 		cfg.CustomProviderPrompt = strings.TrimSpace(*input.CustomProviderPrompt)
+	}
+	if input.CustomPolicyThreshold != nil {
+		cfg.CustomPolicyThreshold = *input.CustomPolicyThreshold
 	}
 	if input.SampleRate != nil {
 		cfg.SampleRate = *input.SampleRate
@@ -2323,6 +2338,12 @@ func (cfg *ContentModerationConfig) normalize() {
 	if cfg.CustomProviderPrompt == "" {
 		cfg.CustomProviderPrompt = defaultCustomProviderPrompt
 	}
+	if cfg.CustomPolicyThreshold <= 0 {
+		cfg.CustomPolicyThreshold = defaultCustomPolicyThreshold
+	}
+	if cfg.CustomPolicyThreshold > 1 {
+		cfg.CustomPolicyThreshold = 1
+	}
 
 	if cfg.ProxyID != nil && *cfg.ProxyID <= 0 {
 		cfg.ProxyID = nil
@@ -2597,6 +2618,7 @@ func (s *ContentModerationService) configView(cfg *ContentModerationConfig) *Con
 		Model:                          cfg.Model,
 		Providers:                      providers,
 		CustomProviderPrompt:           cfg.CustomProviderPrompt,
+		CustomPolicyThreshold:          cfg.CustomPolicyThreshold,
 		ProxyID:                        cloneInt64Ptr(cfg.ProxyID),
 		APIKeyConfigured:               len(keys) > 0,
 		APIKeyMasked:                   apiKeyMasked,
