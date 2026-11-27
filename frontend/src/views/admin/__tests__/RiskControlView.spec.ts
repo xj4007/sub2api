@@ -630,4 +630,53 @@ describe('admin RiskControlView', () => {
       'overflow-y-auto',
     ]))
   })
+
+  it('offers System One for jev models and prefills the model name', async () => {
+    const wrapper = mount(RiskControlView, {
+      global: {
+        stubs: {
+          AppLayout: AppLayoutStub,
+          BaseDialog: BaseDialogStub,
+          Icon: true,
+          Select: true,
+          Toggle: true,
+          Pagination: true,
+          ModelWhitelistSelector: ModelWhitelistSelectorStub,
+          ProxySelector: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    await findButtonByText(wrapper, 'admin.riskControl.openSettings').trigger('click')
+    await wrapper.get('[data-test="moderation-providers-tab"]').trigger('click')
+    await findButtonByText(wrapper, '新增 Provider').trigger('click')
+
+    const endpointSelect = wrapper.findAll('select').find((select) => select.text().includes('System One'))
+    expect(endpointSelect).toBeTruthy()
+    expect(endpointSelect!.text()).not.toContain('Responses')
+    expect(endpointSelect!.text()).not.toContain('Messages')
+    expect(wrapper.get('#moderation-provider-model-options').findAll('option').map((option) => option.attributes('value'))).toEqual([
+      'jev-1.14',
+      'jev-1.13-free',
+      'jev-latest',
+    ])
+
+    await endpointSelect!.setValue('systemone')
+    await flushPromises()
+    const modelInput = wrapper.get('input[placeholder="jev-1.14 / jev-1.13-free"]')
+    expect((modelInput.element as HTMLInputElement).value).toBe('jev-1.14')
+
+    await wrapper.get('input[placeholder="https://moderator.example 或 https://moderator.example/v1"]').setValue('http://154.21.198.41:3425/v1')
+    await wrapper.get('input[placeholder="API Key（留空保留原密钥）"]').setValue('jev-key')
+    await findButtonByText(wrapper, '测试请求').trigger('click')
+    await flushPromises()
+
+    expect(testProvider).toHaveBeenCalledWith(expect.objectContaining({
+      provider_id: 'provider-1',
+      provider: expect.objectContaining({ endpoint: 'systemone', model: 'jev-1.14' }),
+      prompt: 'This is a provider connectivity test.',
+    }))
+    expect(showSuccess).toHaveBeenCalledWith('Provider 测试请求成功')
+  })
 })

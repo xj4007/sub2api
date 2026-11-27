@@ -721,13 +721,13 @@
 
           <div v-else-if="activeSettingsTab === 'providers'" class="space-y-5">
             <div class="rounded-lg border border-primary-100 bg-primary-50/50 p-4 text-sm text-gray-600 dark:border-primary-900/40 dark:bg-primary-900/10 dark:text-gray-300">
-              自定义审核 Provider 配置保存在 Redis，不新增数据库表或 migration。只有明确返回 allow=false 才会拦截。
+              自定义审核 Provider 配置保存在 Redis，不新增数据库表或 migration。Chat Completions 只有明确返回 allow=false 才会拦截；System One（Jev 模型）固定请求 /v1/systemone，按下方阈值判定是否拦截，图片不参与审核。
             </div>
             <div data-test="custom-provider-prompt-editor" class="rounded-lg border border-gray-100 p-4 dark:border-dark-700">
               <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div class="flex flex-col gap-1">
                   <h3 class="text-base font-semibold text-gray-900 dark:text-white">审核规则提示词</h3>
-                  <p class="text-sm text-gray-500 dark:text-gray-400">这里仅编辑审核规则正文，所有启用的自定义 Provider 共用这段规则。</p>
+                  <p class="text-sm text-gray-500 dark:text-gray-400">这里仅编辑审核规则正文，所有启用的 Chat Completions Provider 共用这段规则；System One（Jev）固定使用内置 13 类审核规则。</p>
                 </div>
                 <button type="button" class="btn btn-secondary inline-flex items-center gap-2 text-sm" title="恢复内置审核规则" @click="resetCustomProviderPrompt">
                   <Icon name="refresh" size="sm" />
@@ -749,8 +749,8 @@
               <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
                 <input v-model.trim="provider.id" class="input" placeholder="Provider ID" />
                 <input v-model.trim="provider.base_url" class="input" placeholder="https://moderator.example 或 https://moderator.example/v1" />
-                <select v-model="provider.endpoint" class="input"><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option><option value="messages">Messages</option></select>
-                <input v-model.trim="provider.model" class="input" placeholder="moderation-model" />
+                <select v-model="provider.endpoint" class="input" @change="onProviderEndpointChange(provider)"><option value="chat_completions">Chat Completions</option><option value="systemone">System One（Jev 模型）</option></select>
+                <input v-model.trim="provider.model" class="input" list="moderation-provider-model-options" :placeholder="provider.endpoint === 'systemone' ? 'jev-1.14 / jev-1.13-free' : 'moderation-model'" />
                 <input v-model="provider.api_key" class="input" type="password" autocomplete="new-password" :placeholder="provider.api_key_masked || 'API Key（留空保留原密钥）'" />
                 <input v-model.number="provider.timeout_ms" class="input" type="number" min="500" max="30000" placeholder="Timeout ms" />
                 <input v-model.trim="provider.note" class="input" placeholder="备注（可选）" />
@@ -764,6 +764,11 @@
                 {{ providerTestResult[provider.id].message }}
               </span>
             </div>
+            <datalist id="moderation-provider-model-options">
+              <option value="jev-1.14"></option>
+              <option value="jev-1.13-free"></option>
+              <option value="jev-latest"></option>
+            </datalist>
             <button type="button" class="btn btn-secondary" @click="addProvider">新增 Provider</button>
           </div>
           <div v-else-if="activeSettingsTab === 'scope'" class="space-y-5">
@@ -1345,7 +1350,7 @@ const configForm = reactive({
   keyword_blocking_mode: 'keyword_and_api' as KeywordBlockingMode,
   model_filter_type: 'all' as ContentModerationModelFilterType,
   model_filter_models: [] as string[],
-  providers: [] as Array<{ id: string; base_url: string; endpoint: 'chat_completions' | 'responses' | 'messages'; model: string; priority: number; enabled: boolean; timeout_ms: number; note: string; api_key: string; api_key_masked: string }>,
+  providers: [] as Array<{ id: string; base_url: string; endpoint: 'chat_completions' | 'systemone'; model: string; priority: number; enabled: boolean; timeout_ms: number; note: string; api_key: string; api_key_masked: string }>,
 })
 
 const engineFields = ['base_url', 'model', 'proxy_id', 'api_keys_text', 'api_key_configured', 'api_key_masked', 'api_key_count', 'api_key_masks', 'api_key_statuses', 'api_keys_mode', 'clear_api_key', 'timeout_ms', 'retry_count', 'thresholds'] as const
@@ -1890,6 +1895,12 @@ function applyConfig(config: ContentModerationConfig) {
   pendingDeleteApiKeyHashes.value = [...pendingDeletes]
 }
 
+function onProviderEndpointChange(provider: typeof configForm.providers[number]) {
+  if (provider.endpoint === 'systemone' && !provider.model.trim()) {
+    provider.model = 'jev-1.14'
+  }
+}
+
 function addProvider() {
   configForm.providers.push({ id: `provider-${configForm.providers.length + 1}`, base_url: '', endpoint: 'chat_completions', model: '', priority: configForm.providers.length + 1, enabled: false, timeout_ms: 3000, note: '', api_key: '', api_key_masked: '' })
 }
@@ -1915,9 +1926,10 @@ async function testCustomProvider(provider: typeof configForm.providers[number])
         timeout_ms: Number(provider.timeout_ms) || 0,
         note: provider.note,
       },
-      prompt: 'This is a provider connectivity test. Return allow=true as JSON.',
+      prompt: provider.endpoint === 'systemone' ? 'This is a provider connectivity test.' : 'This is a provider connectivity test. Return allow=true as JSON.',
     })
-    providerTestResult[id] = { ok: true, message: result.allow ? '请求成功：Provider 返回 allow=true' : '请求成功：Provider 返回 allow=false' }
+    const detail = result.reason ? `（${result.reason}）` : ''
+    providerTestResult[id] = { ok: true, message: `请求成功：allow=${result.allow}，flagged=${result.flagged}${detail}` }
     appStore.showSuccess('Provider 测试请求成功')
   } catch (err: unknown) {
     providerTestResult[id] = { ok: false, message: extractApiErrorMessage(err, 'Provider 请求失败，已按策略处理') }

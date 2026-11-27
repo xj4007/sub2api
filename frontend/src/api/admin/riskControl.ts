@@ -10,7 +10,7 @@ export interface ModerationEngineMeta {
 }
 export type KeywordBlockingMode = 'keyword_only' | 'keyword_and_api' | 'api_only'
 export type ContentModerationModelFilterType = 'all' | 'include' | 'exclude'
-export type ModerationProviderEndpoint = 'chat_completions' | 'responses' | 'messages'
+export type ModerationProviderEndpoint = 'chat_completions' | 'systemone'
 
 export interface ContentModerationProvider {
   id: string

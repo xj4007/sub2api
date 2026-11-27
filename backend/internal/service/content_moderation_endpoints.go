@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,9 +20,22 @@ import (
 
 const (
 	ModerationEndpointChatCompletions = "chat_completions"
-	ModerationEndpointResponses       = "responses"
-	ModerationEndpointMessages        = "messages"
+	// ModerationEndpointSystemOne speaks the TypeSafe "System One" protocol
+	// (POST /v1/systemone) used by Jev models.
+	ModerationEndpointSystemOne = "systemone"
 )
+
+// The Responses and Messages adapters were removed; these names are still
+// accepted so provider configurations stored before the removal keep loading.
+const (
+	legacyModerationEndpointResponses = "responses"
+	legacyModerationEndpointMessages  = "messages"
+)
+
+// errModerationProviderNoText reports that the audited payload carries no text
+// (for example an image-only request). It is not a configuration failure, so
+// the provider is skipped instead of being disabled.
+var errModerationProviderNoText = errors.New("moderation provider has no text to audit")
 
 // ModerationProviderConfig describes an independently scheduled custom review provider.
 // APIKey is write-only: config reads must return ContentModerationProviderView instead.
@@ -117,8 +131,12 @@ func (e *moderationProviderResponseError) Error() string {
 
 func NormalizeModerationEndpoint(endpoint string) (string, error) {
 	switch strings.TrimSpace(endpoint) {
-	case ModerationEndpointChatCompletions, ModerationEndpointResponses, ModerationEndpointMessages:
+	case ModerationEndpointChatCompletions, ModerationEndpointSystemOne:
 		return strings.TrimSpace(endpoint), nil
+	case legacyModerationEndpointResponses, legacyModerationEndpointMessages:
+		// Both legacy adapters carried the same chat messages; providers stored
+		// with them stay auditable through chat_completions.
+		return ModerationEndpointChatCompletions, nil
 	default:
 		return "", fmt.Errorf("unsupported moderation endpoint %q", endpoint)
 	}
@@ -170,7 +188,7 @@ func normalizeModerationProviders(providers []ModerationProviderConfig) ([]Moder
 func normalizeModerationBaseURL(raw string) string {
 	base := strings.TrimRight(strings.TrimSpace(raw), "/")
 	lower := strings.ToLower(base)
-	for _, suffix := range []string{"/v1/chat/completions", "/v1/responses", "/v1/messages"} {
+	for _, suffix := range []string{"/v1/chat/completions", "/v1/systemone", "/v1/responses", "/v1/messages"} {
 		if strings.HasSuffix(lower, suffix) {
 			return strings.TrimRight(base[:len(base)-len(suffix)], "/")
 		}
@@ -263,7 +281,8 @@ func (s *ContentModerationService) callCustomModerationProviders(ctx context.Con
 				err = marshalErr
 			}
 			if err == nil {
-				decision, callErr := moderateWithProviderPrompt(reqCtx, client, provider, cfg.CustomProviderPrompt, string(text))
+				state, _ := typeSafeText(input)
+				decision, callErr := moderateWithProvider(reqCtx, client, provider, cfg.CustomProviderPrompt, string(text), state, cfg.Thresholds)
 				err = callErr
 				if err == nil {
 					cancel()
@@ -272,7 +291,7 @@ func (s *ContentModerationService) callCustomModerationProviders(ctx context.Con
 			}
 		}
 		cancel()
-		if err != nil && !isModerationProviderTimeout(err) {
+		if err != nil && !isModerationProviderTimeout(err) && !errors.Is(err, errModerationProviderNoText) {
 			s.disableModerationProvider(ctx, cfg, provider.ID)
 		}
 		if err != nil {
@@ -334,7 +353,7 @@ func (s *ContentModerationService) TestCustomModerationProvider(ctx context.Cont
 
 	prompt := strings.TrimSpace(input.Prompt)
 	if prompt == "" {
-		prompt = "This is a provider connectivity test. Return allow=true as JSON."
+		prompt = "This is a provider connectivity test."
 	}
 	timeoutMS := provider.TimeoutMS
 	if timeoutMS <= 0 {
@@ -344,20 +363,20 @@ func (s *ContentModerationService) TestCustomModerationProvider(ctx context.Cont
 	client, callErr := s.moderationHTTPClient(testCtx, cfg)
 	if callErr == nil {
 		var decision ModerationDecision
-		decision, callErr = moderateWithProviderPrompt(testCtx, client, provider, cfg.CustomProviderPrompt, prompt)
+		decision, callErr = moderateWithProvider(testCtx, client, provider, cfg.CustomProviderPrompt, prompt, prompt, cfg.Thresholds)
 		if callErr == nil {
 			cancel()
 			return &TestModerationProviderResult{ProviderID: provider.ID, Allowed: decision.Allowed, Flagged: decision.Flagged, Reason: decision.Reason, Categories: decision.Categories}, nil
 		}
 	}
 	cancel()
-	if usesSavedProvider && !isModerationProviderTimeout(callErr) {
+	if usesSavedProvider && !isModerationProviderTimeout(callErr) && !errors.Is(callErr, errModerationProviderNoText) {
 		s.disableModerationProvider(ctx, cfg, provider.ID)
 	}
 	if isModerationProviderTimeout(callErr) {
 		return nil, infraerrors.GatewayTimeout("CONTENT_MODERATION_PROVIDER_TIMEOUT", "Provider 请求超时")
 	}
-	return nil, infraerrors.New(http.StatusBadGateway, "CONTENT_MODERATION_PROVIDER_REQUEST_FAILED", moderationProviderTestFailureMessage(callErr))
+	return nil, infraerrors.New(http.StatusBadGateway, "CONTENT_MODERATION_PROVIDER_REQUEST_FAILED", moderationProviderTestFailureMessage(callErr, provider.Endpoint))
 }
 
 // disableModerationProvider persists a non-timeout provider failure. Timeout
@@ -384,12 +403,14 @@ func (s *ContentModerationService) disableModerationProvider(ctx context.Context
 	s.replaceRuntimeConfig(next, raw)
 }
 
-func moderationProviderTestFailureMessage(err error) string {
+func moderationProviderTestFailureMessage(err error, endpoint string) string {
 	var httpErr *moderationProviderHTTPError
 	if errors.As(err, &httpErr) {
 		switch httpErr.StatusCode {
-		case http.StatusUnauthorized, http.StatusForbidden:
+		case http.StatusUnauthorized:
 			return "Provider API Key 无效或无权限"
+		case http.StatusForbidden:
+			return "Provider 拒绝访问（403），请检查 API Key 权限、账号所在地区限制或审计代理设置"
 		case http.StatusNotFound:
 			return "Provider 返回 404，请检查 Base URL、Endpoint 和 Model"
 		default:
@@ -398,7 +419,13 @@ func moderationProviderTestFailureMessage(err error) string {
 	}
 	var responseErr *moderationProviderResponseError
 	if errors.As(err, &responseErr) {
+		if endpoint == ModerationEndpointSystemOne {
+			return "Provider 响应格式错误，systemone 必须返回 answers 中每个问题的 noul 分数（0-1）"
+		}
 		return "Provider 响应格式错误，必须返回包含 allow 布尔字段的 JSON"
+	}
+	if errors.Is(err, errModerationProviderNoText) {
+		return "System One 只能审核文本，当前请求没有可审核文本"
 	}
 	return "Provider 连接失败，请检查 URL、网络或代理"
 }
@@ -412,7 +439,22 @@ func isModerationProviderTimeout(err error) bool {
 }
 
 func ModerateWithProvider(ctx context.Context, client *http.Client, provider ModerationProviderConfig, input string) (ModerationDecision, error) {
-	return moderateWithProviderPrompt(ctx, client, provider, defaultCustomProviderPrompt, input)
+	return moderateWithProvider(ctx, client, provider, defaultCustomProviderPrompt, input, input, nil)
+}
+
+// moderateWithProvider evaluates one provider. input is the chat-completions
+// payload (policy prompt or JSON content parts); state is the plain audited
+// text used by systemone providers. thresholds decides flagged for adapters
+// that answer with category scores instead of an allow boolean.
+func moderateWithProvider(ctx context.Context, client *http.Client, provider ModerationProviderConfig, policy, input, state string, thresholds map[string]float64) (ModerationDecision, error) {
+	endpoint, err := NormalizeModerationEndpoint(provider.Endpoint)
+	if err != nil {
+		return ModerationDecision{}, err
+	}
+	if endpoint == ModerationEndpointSystemOne {
+		return moderateWithSystemOneProvider(ctx, client, provider, state, thresholds)
+	}
+	return moderateWithChatProvider(ctx, client, provider, policy, input)
 }
 
 func buildCustomProviderPrompt(policy string, input string) string {
@@ -434,25 +476,13 @@ The "allow" field is authoritative. Keep "allow" and "flagged" consistent: allow
 </CONTENT>`
 }
 
-func moderateWithProviderPrompt(ctx context.Context, client *http.Client, provider ModerationProviderConfig, policy string, input string) (ModerationDecision, error) {
+func moderateWithChatProvider(ctx context.Context, client *http.Client, provider ModerationProviderConfig, policy string, input string) (ModerationDecision, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	path := map[string]string{
-		ModerationEndpointChatCompletions: "/v1/chat/completions",
-		ModerationEndpointResponses:       "/v1/responses",
-		ModerationEndpointMessages:        "/v1/messages",
-	}[provider.Endpoint]
+	path := "/v1/chat/completions"
 	prompt := buildCustomProviderPrompt(policy, input)
-	var payload any
-	switch provider.Endpoint {
-	case ModerationEndpointResponses:
-		payload = map[string]any{"model": provider.Model, "input": prompt}
-	case ModerationEndpointMessages:
-		payload = map[string]any{"model": provider.Model, "max_tokens": 256, "messages": []any{map[string]string{"role": "user", "content": prompt}}}
-	default:
-		payload = map[string]any{"model": provider.Model, "messages": []any{map[string]string{"role": "user", "content": prompt}}}
-	}
+	payload := map[string]any{"model": provider.Model, "messages": []any{map[string]string{"role": "user", "content": prompt}}}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return ModerationDecision{}, err
@@ -516,4 +546,77 @@ func moderateWithProviderPrompt(ctx context.Context, client *http.Client, provid
 		return ModerationDecision{}, &moderationProviderResponseError{reason: "decision must contain allow"}
 	}
 	return decision, nil
+}
+
+// moderateWithSystemOneProvider asks a Jev model through the System One
+// protocol for one noul score per moderation category and turns those scores
+// into an allow/flagged decision with the configured thresholds.
+func moderateWithSystemOneProvider(ctx context.Context, client *http.Client, provider ModerationProviderConfig, state string, thresholds map[string]float64) (ModerationDecision, error) {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return ModerationDecision{}, errModerationProviderNoText
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	questions := typeSafeModerationQuestions()
+	raw, err := json.Marshal(map[string]any{
+		"model":     provider.Model,
+		"state":     state,
+		"questions": questions,
+	})
+	if err != nil {
+		return ModerationDecision{}, err
+	}
+	baseURL := normalizeModerationBaseURL(provider.BaseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/systemone", bytes.NewReader(raw))
+	if err != nil {
+		return ModerationDecision{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ModerationDecision{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return ModerationDecision{}, &moderationProviderHTTPError{StatusCode: resp.StatusCode}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return ModerationDecision{}, &moderationProviderResponseError{reason: "read body"}
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return ModerationDecision{}, &moderationProviderResponseError{reason: "empty body"}
+	}
+	var envelope struct {
+		Answers map[string]struct {
+			Type string   `json:"type"`
+			Noul *float64 `json:"noul"`
+		} `json:"answers"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return ModerationDecision{}, &moderationProviderResponseError{reason: "invalid JSON envelope"}
+	}
+	scores := make(map[string]float64, len(questions))
+	for id := range questions {
+		answer, ok := envelope.Answers[id]
+		if !ok || answer.Type != "noul" || answer.Noul == nil {
+			return ModerationDecision{}, &moderationProviderResponseError{reason: "missing systemone answer " + id}
+		}
+		score := *answer.Noul
+		if math.IsNaN(score) || math.IsInf(score, 0) || score < 0 || score > 1 {
+			return ModerationDecision{}, &moderationProviderResponseError{reason: "systemone answer out of range " + id}
+		}
+		scores[id] = score
+	}
+	flagged, highestCategory, highestScore := evaluateModerationScores(scores, mergeContentModerationThresholds(ContentModerationDefaultThresholds(), thresholds))
+	return ModerationDecision{
+		Allowed:    !flagged,
+		Flagged:    flagged,
+		Categories: scores,
+		Reason:     fmt.Sprintf("systemone: %s %.3f", highestCategory, highestScore),
+		Confidence: highestScore,
+	}, nil
 }
